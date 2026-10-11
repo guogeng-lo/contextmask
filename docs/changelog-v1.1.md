@@ -172,4 +172,4 @@ v1.1做好之後，我負責基本操作和使用體驗回饋，另外請Codex�
 - 新手的步驟說明還沒有找真的新手試用過。我自己用是沒問題，但旁觀者清，還是要有別人實際用過才算數。
 - JSON的冒號單獨寫在一行時會誤遮，雖然會被JSON檢查擋下、不能複製，但還是一個已知的限制（規格書6.2）。
 - Claude的自動測試是在Linux的Node.js和Chromium上跑的；Codex另外在Windows重跑核心和隨機測試，並做部分畫面檢查，沒有完整重跑整套瀏覽器測試。我負責基本操作和使用體驗回饋。Edge、Chrome、Brave和我自己的手機我有操作過；Firefox、Safari、螢幕閱讀器還沒驗收。
-- GitHub Pages上的線上版本還沒驗收（規格書A27）。
+- （已完成）我把網站放上GitHub Pages：https://guogeng-lo.github.io/contextmask/，用無痕視窗走過一次流程，也請Claude幫我核對線上版和repo的檔案（規格書A27）。

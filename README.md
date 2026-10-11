@@ -9,6 +9,8 @@
 
 路徑只換掉使用者名稱那一段，斜線、檔名和行號都留著，AI還是看得懂錯誤在哪裡。
 
+**網頁版：[https://guogeng-lo.github.io/contextmask/](https://guogeng-lo.github.io/contextmask/)**
+
 ## 我做這個工具的出發點
 
 > **把使用者當成什麼都不會的人來設計。**
@@ -19,7 +21,7 @@
 
 ## 怎麼用
 
-打開這個repo的GitHub Pages網頁，或下載`index.html`直接用瀏覽器打開（不用安裝，也可以離線用）。
+打開網頁版：[https://guogeng-lo.github.io/contextmask/](https://guogeng-lo.github.io/contextmask/)，或下載`index.html`直接用瀏覽器打開（不用安裝，也可以離線用）。
 
 1. 貼上錯誤訊息、程式碼或設定檔；姓名、學號這種規則猜不到的，可以加進自訂文字。
 2. 按「掃描敏感資訊」，逐筆決定要遮罩還是保留。
