@@ -1,0 +1,6 @@
+USER_1 = "existing_variable"
+Traceback (most recent call last):
+  File "C:\Users\demo_user\Desktop\sample-project\main.py", line 27, in <module>
+    open("config.json")
+PermissionError: [Errno 13] Permission denied: 'C:\Users\demo_user\Desktop\sample-project\config.json'
+Config: C:/Users/demo_user/Desktop/sample-project/config.json

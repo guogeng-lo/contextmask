@@ -1,0 +1,192 @@
+<p id="bootError" class="boot-error">網頁程式沒有啟動。請重新整理；如果還是這樣，請確認瀏覽器允許執行JavaScript。</p>
+<div class="shell">
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <div class="brand-text">
+        <h1>ContextMask <span class="version">v1.1</span></h1>
+        <p class="tagline">貼給AI除錯之前，先把隱私換成代號；AI回覆之後，再換回原本的內容。</p>
+      </div>
+    </div>
+    <div class="top-actions">
+      <button type="button" id="btnSample">載入範例</button>
+      <button type="button" id="btnClear" class="danger">清除全部</button>
+    </div>
+  </header>
+
+  <div class="intro">
+    <figure class="example">
+      <figcaption>例如錯誤訊息裡的路徑：</figcaption>
+      <div class="example-lines">
+        <code class="example-line">C:\Users\<span class="example-raw">wang</span>\Desktop\hw5\main.py</code>
+        <span class="example-arrow" aria-hidden="true">⟶</span>
+        <code class="example-line">C:\Users\<span class="tape">USER_1</span>\Desktop\hw5\main.py</code>
+      </div>
+    </figure>
+    <p class="local"><span class="local-dot" aria-hidden="true"></span>在你的瀏覽器裡處理，網頁不會把貼上的內容傳出去；對照表只留在這個分頁，重新整理或關掉就清除。</p>
+    <details class="guide" id="guideBox" open>
+      <summary><span class="guide-title">第一次用？照這5步做</span><span class="guide-fold">看過了可以收起來</span></summary>
+      <ol class="guide-list" id="guideList">
+        <li data-step="1"><b>貼上原文</b><span>把錯誤訊息、程式碼或設定檔貼進第1步的框。姓名、學號這種，在下面「自訂要遮的文字」加進去。</span><em>→ 按「掃描敏感資訊」</em></li>
+        <li data-step="2"><b>檢查要遮哪些</b><span>一筆一筆看，選「遮罩」的會換成代號。不確定就選遮罩；橘色框的提醒要先看。</span><em>→ 按「產生遮罩結果」</em></li>
+        <li data-step="3"><b>複製給AI</b><span>看一遍結果，黃色的是代號。有「要確認」的提醒，先補自訂文字，或看過再勾選確認。</span><em>→ 按「複製給AI」，貼到AI的對話框</em></li>
+        <li data-step="4"><b>貼回AI的回覆</b><span>AI回答之後，把回答整段貼回第4步的框。</span><em>→ 按「還原代號」</em></li>
+        <li data-step="5"><b>看還原結果</b><span>代號會換回原本的內容；看下面的摘要，有沒有換不回來的代號。</span><em>→ 按「複製還原結果」自己用</em></li>
+      </ol>
+      <p class="guide-rule"><b>可以貼給AI的，只有第3步「複製給AI」複製出來的內容。</b>第1步的原文和第5步的還原結果都有你的隱私，不要貼給AI。</p>
+    </details>
+    <section class="scope" aria-labelledby="hScope">
+      <h2 id="hScope" class="scope-title">用之前先知道：工具找得到什麼、找不到什麼</h2>
+      <ul class="scope-lines">
+        <li class="scope-yes"><b>會自動找</b>路徑裡的電腦使用者名稱、API金鑰和密碼這類欄位、資料庫連線字串、電子郵件、身分證字號、手機號碼、IP位址。</li>
+        <li class="scope-no"><b>要你自己加</b>姓名、學號、專案名稱、公司或學校的名稱，規則猜不到；請加進第1步的「自訂要遮的文字」。檔名、資料夾名稱和註解也可能透露你是誰。</li>
+      </ul>
+      <details class="scope-more" id="scopeDetails">
+        <summary>完整的支援範圍和限制</summary>
+        <ul>
+          <li>使用者路徑：Windows、WSL、Linux、macOS的使用者資料夾名稱，例如<code>C:\Users\wang</code>、<code>/home/wang</code>。</li>
+          <li>金鑰和憑證：sk-、ghp_、github_pat_、AIza、AKIA、xoxb-開頭的金鑰，JWT，資料庫連線字串裡的密碼和主機。</li>
+          <li>敏感欄位：password、token、api_key、secret這類欄位的值。JSON、YAML（包含<code>|</code>和<code>&gt;</code>的多行值、清單、值寫在下一行）、.env和命令列、Python（包含三引號）、JavaScript（包含反引號）都認得；三引號、反引號、陣列這類跨行的值最多往下看200行。程式裡和寫死的字串比對（<code>if password == "…"</code>）、SQL和log字串裡的密碼、讀設定和寫設定時寫在程式裡的值也會遮。</li>
+          <li>物件裡的欄位只看各自的名稱：像<code>secrets:</code>底下的<code>db: …</code>，因為<code>db</code>不是敏感欄位，不會自動遮。這種物件會列在「複製給AI」上面，請檢查一下，需要遮的值加進自訂文字。</li>
+          <li>個人資料：電子郵件、身分證字號、台灣手機號碼、IPv4。姓名、學號這類規則猜不到的，請用自訂文字。</li>
+          <li>認出來但沒辦法完整遮住的地方（例如找不到結尾引號），會列在「複製給AI」上面，要你確認之後才能複製。私鑰區塊、會讓代號換不回來或讓原本的JSON失效的結果，一律不能複製。</li>
+          <li>規則只認得常見的格式，沒抓到不代表沒有敏感資訊；檔名、資料夾名稱和註解也可能透露身分，貼給AI之前請再看一遍。</li>
+        </ul>
+      </details>
+    </section>
+  </div>
+
+  <main class="workspace">
+    <section class="panel area-source" id="panelSource" aria-labelledby="hSource">
+      <div class="panel-head">
+        <span class="step" aria-hidden="true">1</span>
+        <h2 id="hSource">貼上原文</h2>
+        <span class="badge" id="srcCount">0／100,000字</span>
+      </div>
+      <label class="sr-only" for="source">原文</label>
+      <textarea id="source" class="editor" wrap="off" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" placeholder="把錯誤訊息、程式碼或設定檔貼在這裡"></textarea>
+      <div class="panel-body keywords">
+        <div class="sub-head">
+          <h3>自訂要遮的文字</h3>
+          <span class="badge" id="kwCount">0／50筆</span>
+        </div>
+        <p class="hint">姓名、學號這類規則猜不到的內容，可以自己加。大小寫要完全一樣。</p>
+        <form id="kwForm" class="kw-form" novalidate>
+          <label class="sr-only" for="kwType">類型</label>
+          <select id="kwType">
+            <option value="NAME">姓名</option>
+            <option value="SID">學號</option>
+            <option value="PROJECT">專案名稱</option>
+            <option value="WORD">其他</option>
+          </select>
+          <label class="sr-only" for="kwText">要遮的文字</label>
+          <textarea id="kwText" class="kw-input" rows="1" wrap="off" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" placeholder="例如：王小明"></textarea>
+          <button type="submit" id="kwAdd">加入</button>
+        </form>
+        <p class="note" id="kwNote" role="status" aria-live="polite"></p>
+        <ul class="kw-list" id="kwList" aria-label="已加入的自訂文字"></ul>
+      </div>
+      <div class="panel-foot">
+        <button type="button" id="btnScan" class="primary">掃描敏感資訊</button>
+        <p class="note" id="scanNote" role="status" aria-live="polite"></p>
+      </div>
+    </section>
+
+    <section class="panel area-review" id="panelReview" aria-labelledby="hReview">
+      <div class="panel-head">
+        <span class="step" aria-hidden="true">2</span>
+        <h2 id="hReview">檢查要遮哪些</h2>
+        <span class="badge" id="reviewBadge">還沒掃描</span>
+      </div>
+      <div class="review-tools">
+        <p class="stats" id="reviewStats">掃描後會列出找到的內容，每一筆都可以選擇遮罩或保留。</p>
+        <div class="tool-row">
+          <button type="button" id="btnAllMask" class="small">全部遮罩</button>
+          <button type="button" id="btnAllKeep" class="small">全部保留</button>
+          <button type="button" id="btnPreview" class="small" aria-expanded="false" aria-controls="previewBox">顯示原文標記</button>
+        </div>
+        <p class="hint">可信度代表規則有多明確，不是準確率。每一筆的判斷依據可以展開來看。</p>
+      </div>
+      <div class="alerts" id="alerts"></div>
+      <div class="preview" id="previewBox" hidden>
+        <p class="legend"><mark class="mask">黃色</mark>會遮罩，<mark class="keep">虛線</mark>保留。點標記可以跳到清單裡那一筆。</p>
+        <pre class="code preview-code" id="previewText" tabindex="0" aria-label="原文標記預覽"></pre>
+      </div>
+      <ol class="cands" id="candList" aria-label="偵測到的內容"></ol>
+      <div class="pager" id="pager" hidden>
+        <button type="button" id="btnPrev" class="small">上一頁</button>
+        <span id="pageInfo"></span>
+        <button type="button" id="btnNext" class="small">下一頁</button>
+      </div>
+      <div class="panel-foot">
+        <button type="button" id="btnGenerate" class="primary">產生遮罩結果</button>
+        <p class="note" id="reviewNote" role="status" aria-live="polite"></p>
+      </div>
+    </section>
+
+    <section class="panel area-result" id="panelResult" aria-labelledby="hResult">
+      <div class="panel-head">
+        <span class="step" aria-hidden="true">3</span>
+        <h2 id="hResult">複製給AI</h2>
+        <span class="badge" id="resultBadge">還沒產生</span>
+      </div>
+      <pre class="code" id="maskedText" tabindex="0" aria-label="遮罩後的內容"></pre>
+      <div class="skip-notes" id="skipNotes"></div>
+      <div class="summary" id="copySummary" aria-label="複製前檢查"></div>
+      <div class="confirm-box" id="confirmBox" hidden>
+        <label class="confirm-check"><input type="checkbox" id="confirmRisk">本次內容仍有未完整遮罩的敏感項目，我已查看並決定繼續複製</label>
+        <p class="confirm-hint">只算這一次產生的結果。原文、自訂文字或遮罩選擇有變動，或重新產生之後，要重新確認。</p>
+      </div>
+      <div class="panel-foot">
+        <label class="option"><input type="checkbox" id="optGuide" checked>開頭附上給AI的代號說明</label>
+        <button type="button" id="btnCopy" class="primary">複製給AI</button>
+        <p class="note" id="copyNote" role="status" aria-live="polite"></p>
+        <details id="copyDetails">
+          <summary>看實際會複製出去的全文（開頭給AI的代號說明＋上面的遮罩結果）</summary>
+          <label class="sr-only" for="copyText">要複製的完整內容</label>
+          <textarea id="copyText" class="editor compact" wrap="off" readonly spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" placeholder="可以複製的時候，這裡會顯示要貼給AI的完整內容。"></textarea>
+        </details>
+      </div>
+    </section>
+  </main>
+
+  <section class="restore" aria-label="還原AI的回覆">
+    <section class="panel area-reply" id="panelReply" aria-labelledby="hReply">
+      <div class="panel-head">
+        <span class="step" aria-hidden="true">4</span>
+        <h2 id="hReply">貼回AI的回覆</h2>
+        <span class="badge" id="replyCount">0／100,000字</span>
+      </div>
+      <label class="sr-only" for="reply">AI的回覆</label>
+      <textarea id="reply" class="editor" wrap="off" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" placeholder="把AI的回答貼在這裡"></textarea>
+      <div class="panel-foot">
+        <button type="button" id="btnRestore" class="primary">還原代號</button>
+        <p class="note" id="restoreNote" role="status" aria-live="polite">先完成第3步，才能還原。</p>
+      </div>
+    </section>
+
+    <section class="panel area-restored" id="panelRestored" aria-labelledby="hRestored">
+      <div class="panel-head">
+        <span class="step" aria-hidden="true">5</span>
+        <h2 id="hRestored">還原結果</h2>
+        <span class="badge caution" id="restoredBadge" hidden>含原始資料</span>
+      </div>
+      <pre class="code" id="restoredText" tabindex="0" aria-label="還原後的內容"></pre>
+      <div class="summary" id="restoreSummary" aria-label="還原摘要"></div>
+      <div class="panel-foot">
+        <button type="button" id="btnCopyRestored">複製還原結果</button>
+        <p class="note" id="restoredNote" role="status" aria-live="polite"></p>
+        <details id="reportDetails">
+          <summary>完整還原報告</summary>
+          <div class="report" id="report"></div>
+        </details>
+      </div>
+    </section>
+  </section>
+
+  <footer class="foot">
+    <p>這個網頁在你的瀏覽器裡處理文字，不會把你貼的內容傳到伺服器；網頁也用內容安全政策（CSP）禁止對外連線。不過CSP管不到瀏覽器擴充功能、輸入法、剪貼簿工具這些網頁以外的程式，複製出去的內容也一樣，請自己留意。</p>
+    <p>對照表只放在這個分頁的記憶體裡，按「清除全部」、重新整理或關閉分頁就會消失；已經複製到系統剪貼簿的內容不會跟著清掉。</p>
+    <p class="foot-copy">ContextMask © 2026 羅國耕，依Apache License 2.0授權。再發布時請保留著作權與授權聲明。</p>
+  </footer>
+</div>

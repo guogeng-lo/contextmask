@@ -1,0 +1,6 @@
+
+> build
+> node build.cjs
+
+index.html：198542 bytes
+default-src 'none'; script-src 'sha256-POmj9sXTGNsf9k1qiMdD0CO+vhah1usQ2sOb8z8QVpY='; style-src 'sha256-MDNxcXZyRkBNYnAO4VkTSQy65P29fLQ+ETAnsrOHg9o='; connect-src 'none'; img-src 'none'; font-src 'none'; object-src 'none'; frame-src 'none'; worker-src 'none'; base-uri 'none'; form-action 'none'; require-trusted-types-for 'script'; trusted-types 'none'

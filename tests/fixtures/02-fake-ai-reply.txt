@@ -1,0 +1,3 @@
+請先檢查 C:\Users\USER_2\Desktop\sample-project\config.json 的讀取權限。
+USER_1 是程式原本的變數名稱，不需要更名。
+另外也可檢查 C:/Users/USER_9/Desktop/sample-project/config.json。

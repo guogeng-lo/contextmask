@@ -1,0 +1,3509 @@
+'use strict';
+
+/*
+ * ContextMask 1.1
+ * 貼給AI除錯之前，把程式碼、設定檔和錯誤訊息裡的隱私換成代號；
+ * AI回覆之後，再把代號換回原本的內容。
+ *
+ * 這個檔案分成兩部分：
+ *   1. 核心（ContextMask）：只處理文字，不碰畫面、不連網、不存檔。
+ *   2. 畫面：把按鈕和輸入框接到核心。使用者的文字一律用 textContent 或文字節點顯示。
+ */
+
+/* ================================================================
+ * 1. 核心
+ * ================================================================ */
+const ContextMask = (() => {
+
+  /* ---------- 上限 ---------- */
+  // 長度都用 JavaScript 字串長度計算（UTF-16 碼元），和 textarea.value.length 一樣。
+  const LIMITS = Object.freeze({
+    text: 100000,       // 原文、AI回覆各自的上限
+    keywords: 50,       // 自訂文字最多幾筆
+    keywordLength: 200, // 每筆自訂文字最長幾個字
+    candidates: 1000,   // 一次最多列出幾筆偵測結果
+  });
+
+  /* ---------- 代號類型 ---------- */
+  // 代號長這樣：USER_1、KEY_2。label 是畫面上的名稱，risk 是「如果保留」的說明。
+  const TYPES = Object.freeze({
+    USER: { label: '使用者名稱', risk: '會露出電腦的登入名稱，常常就是本名或信箱開頭。' },
+    HOST: { label: '電腦／主機名稱', risk: '可以用來認出是哪一台電腦或哪一台伺服器。' },
+    KEY: { label: 'API金鑰', risk: '別人拿到就能用你的帳號額度或權限。' },
+    TOKEN: { label: '登入權杖', risk: '可能被拿去冒用登入狀態，裡面也可能有帳號資料。' },
+    SECRET: { label: '密碼／機密值', risk: '密碼或金鑰會直接外流。' },
+    EMAIL: { label: '電子郵件', risk: '可以直接聯絡到你，也能拿去查你的其他帳號。' },
+    TWID: { label: '身分證字號', risk: '屬於高度敏感的個人資料。' },
+    PHONE: { label: '手機號碼', risk: '可以直接聯絡到你。' },
+    IP: { label: 'IP位址', risk: '可能透露網路位置。' },
+    NAME: { label: '姓名', risk: '這是你指定要遮住的姓名。' },
+    SID: { label: '學號', risk: '這是你指定要遮住的學號。' },
+    PROJECT: { label: '專案名稱', risk: '這是你指定要遮住的專案名稱。' },
+    WORD: { label: '其他文字', risk: '這是你指定要遮住的內容。' },
+  });
+  const TOKEN_TYPES = Object.keys(TYPES);
+  const CUSTOM_TYPES = Object.freeze(['NAME', 'SID', 'PROJECT', 'WORD']);
+
+  // 同一段文字被好幾條規則抓到時，數字大的規則決定代號類型
+  const PRIORITY = Object.freeze({ credential: 90, uri: 80, path: 70, field: 60, pattern: 50, custom: 40 });
+
+  /* ---------- 共用小工具 ---------- */
+
+  // 給使用者看的錯誤（超過上限、格式不對）。畫面會直接顯示 message。
+  class InputError extends Error {
+    constructor(message) {
+      super(message);
+      this.name = 'InputError';
+    }
+  }
+
+  const fmt = (n) => n.toLocaleString('en-US');
+
+  // 英數字和底線算「字的一部分」。代號前後如果緊貼這些字元，還原時就認不出完整的代號。
+  const isWordChar = (ch) => ch !== undefined && /[A-Za-z0-9_]/.test(ch);
+
+  function shorten(text, max) {
+    return text.length > max ? text.slice(0, max) + '…' : text;
+  }
+
+  // 記下每一行從第幾個字開始，之後可以很快算出「第幾行第幾字」
+  function lineStartsOf(text) {
+    const starts = [0];
+    for (let i = 0; i < text.length; i++) {
+      const code = text.charCodeAt(i);
+      if (code === 10) starts.push(i + 1); // \n
+      else if (code === 13 && text.charCodeAt(i + 1) !== 10) starts.push(i + 1); // 單獨的 \r
+    }
+    return starts;
+  }
+
+  function lineOf(lineStarts, offset) {
+    let low = 0;
+    let high = lineStarts.length - 1;
+    while (low < high) { // 二分搜尋：找最後一個 <= offset 的行首
+      const mid = (low + high + 1) >> 1;
+      if (lineStarts[mid] <= offset) low = mid;
+      else high = mid - 1;
+    }
+    return { line: low + 1, column: offset - lineStarts[low] + 1 };
+  }
+
+  /* ---------- 掃描時共用的紀錄本 ---------- */
+
+  function newContext(source) {
+    return {
+      source,
+      lineStarts: lineStartsOf(source),
+      found: [],             // 偵測到的候選
+      warnings: [],          // 需要使用者自己處理的地方
+      credentials: new Map(), // 已知開頭金鑰的完整範圍，用來和「敏感欄位」合併
+      uriAuthorities: [],    // 連線字串「帳號:密碼@主機」的範圍，避免被誤認成信箱
+    };
+  }
+
+  const tooMany = () => new InputError(
+    `找到超過${fmt(LIMITS.candidates)}筆，數量太多。請把內容分成幾段再掃描，這次沒有產生任何結果。`);
+
+  // 新增一筆候選。start、end 是半開區間 [start, end)，raw 一定等於 source.slice(start, end)。
+  function add(ctx, item) {
+    if (item.end <= item.start) return null;
+    const candidate = {
+      start: item.start,
+      end: item.end,
+      raw: ctx.source.slice(item.start, item.end),
+      type: item.type,
+      priority: item.priority,
+      confidence: item.confidence,
+      selected: item.selected !== false,
+      reasons: [item.reason],
+      risk: item.risk || TYPES[item.type].risk,
+    };
+    ctx.found.push(candidate);
+    if (ctx.found.length > LIMITS.candidates * 5) throw tooMany(); // 數量明顯爆量就提早停止
+    return candidate;
+  }
+
+  // 需要使用者自己處理的地方。level：
+  //   block   ＝不能複製（例如私鑰），確認也不能越過
+  //   confirm ＝已經認出是敏感內容、但沒辦法完整遮住；使用者確認這次的結果後才可以複製
+  //   notice  ＝已經遮了，只是提醒確認範圍
+  // ranges：這些範圍都被遮住時（例如使用者補了自訂文字），就不再算沒處理完。
+  function warn(ctx, offset, kind, level, message, extra = {}) {
+    ctx.warnings.push({
+      offset,
+      line: lineOf(ctx.lineStarts, offset).line,
+      kind,
+      level,
+      blocking: level === 'block',
+      message,
+      risk: extra.risk || '',
+      fix: extra.fix || '',
+      ranges: extra.ranges || [],
+    });
+  }
+
+  /* ================================================================
+   * 偵測規則
+   * ================================================================ */
+
+  /* ---------- 規則1：Windows／WSL 使用者路徑 ---------- */
+  // C:\Users\wang、C:\\Users\\wang、C:/Users/wang、/mnt/c/Users/wang 都只換「wang」這一段，
+  // 斜線、檔名和行號都不動。
+  const WIN_USERS = /(?<![A-Za-z0-9_])(?:[A-Za-z]:|\/mnt\/[A-Za-z])[\\/]+users[\\/]+/gi;
+  // Windows使用者名稱不能有的字元（" / \ [ ] : ; | = , + * ? < > @），加上引號、右括號、換行和Tab
+  const WIN_NAME_STOP = /[\\/"'`<>|:?*[\];=,+@)\r\n\t]/;
+
+  function detectWindowsUsers(ctx) {
+    const s = ctx.source;
+    for (const m of s.matchAll(WIN_USERS)) {
+      const start = m.index + m[0].length;
+      const opening = s[m.index - 1]; // 路徑前面的字元，用來判斷是不是包在引號裡
+      let stop = start;
+      while (stop < s.length) {
+        const ch = s[stop];
+        // O'Brien 這種名字裡的撇號：路徑不是用單引號包起來、而且後面接著英文字母，才算名字的一部分
+        if (ch === "'" && opening !== "'" && stop > start && /[A-Za-z]/.test(s[stop + 1] || '')) {
+          stop++;
+          continue;
+        }
+        if (WIN_NAME_STOP.test(ch)) break;
+        stop++;
+      }
+      let end = stop;
+      while (end > start && (s[end - 1] === ' ' || s[end - 1] === '.')) end--; // 資料夾名稱不會以空白或句點結尾
+      if (end === start) continue;
+
+      const name = s.slice(start, end);
+      const next = s[stop];
+      const hasSpace = /\s/.test(name);
+      // 名稱有空白時，只有後面接著斜線、命令提示字元的「>」，或是和路徑開頭成對的引號，才確定名稱到這裡為止
+      const clearEnd = end === stop && (next === '\\' || next === '/' || next === '>'
+        || (next !== undefined && /["'`]/.test(next) && opening === next));
+
+      if (!hasSpace || clearEnd) {
+        add(ctx, {
+          start, end, type: 'USER', priority: PRIORITY.path, confidence: '高',
+          reason: `出現在「${m[0]}」後面，這一段通常是電腦的登入名稱${hasSpace ? '；名稱裡有空白，整段一起遮' : ''}。`,
+        });
+      } else {
+        warn(ctx, start, 'path-unclear', 'confirm',
+          `「${m[0]}${shorten(name, 40)}」後面沒有明確的結尾，看不出使用者名稱到哪裡為止，所以沒有自動遮。`, {
+            risk: '使用者名稱常常就是本名或信箱開頭，現在會原樣送出。',
+            fix: '把完整的使用者名稱加進自訂文字，再重新掃描。',
+            ranges: [[start, start + 1]],
+          });
+      }
+    }
+  }
+
+  /* ---------- 規則2：Linux／macOS 使用者路徑 ---------- */
+  // /home/wang/app、/Users/wang/app 只換「wang」。
+  // 前面是網址的網域（example.com/home/）不算；PATH=/usr/bin:/home/wang 這種冒號後面的路徑要算。
+  const UNIX_HOME = /(?<![A-Za-z0-9_.~\\-])\/(home|Users)\/([^/\s"'`<>|:?*\\()[\]{},;=+@]+)/g;
+
+  function detectUnixUsers(ctx) {
+    const s = ctx.source;
+    for (const m of s.matchAll(UNIX_HOME)) {
+      // C:/Users/… 這種前面是磁碟機代號的交給Windows規則；/opt/a:/home/… 的 a: 只是資料夾名稱
+      if (s[m.index - 1] === ':' && /[A-Za-z]/.test(s[m.index - 2] || '')) {
+        const beforeDrive = s[m.index - 3];
+        const isDrive = beforeDrive === undefined || /[\s"'`=(,;]/.test(beforeDrive) || s.slice(m.index - 5, m.index - 2) === '///';
+        if (isDrive) continue;
+      }
+      const name = m[2];
+      if (name === '.' || name === '..') continue;
+      const start = m.index + m[1].length + 2; // 跳過「/home/」
+      add(ctx, {
+        start, end: start + name.length, type: 'USER', priority: PRIORITY.path, confidence: '高',
+        reason: `出現在「/${m[1]}/」後面，這一段通常是登入名稱。`,
+      });
+    }
+  }
+
+  /* ---------- 規則3：Windows預設電腦名稱 ---------- */
+  const HOST_NAME = /(?<![A-Za-z0-9_-])(DESKTOP|LAPTOP)-([A-Za-z0-9]{4,15})(?![A-Za-z0-9_-])/gi;
+
+  function detectHostNames(ctx) {
+    for (const m of ctx.source.matchAll(HOST_NAME)) {
+      const allUpper = m[0] === m[0].toUpperCase();
+      if (!allUpper && !/\d/.test(m[2])) continue; // 像 desktop-preview 這種一般英文不算
+      add(ctx, {
+        start: m.index, end: m.index + m[0].length, type: 'HOST', priority: PRIORITY.pattern, confidence: '中',
+        reason: '符合Windows預設電腦名稱的格式（DESKTOP-或LAPTOP-開頭）。',
+      });
+    }
+  }
+
+  /* ---------- 規則4：已知開頭的API金鑰 ---------- */
+  // keepPrefix 為 true：保留開頭、只換後面整段，例如 sk-proj-KEY_1。
+  // 開頭以底線結束的（ghp_、github_pat_）如果保留，會變成 ghp_KEY_1，代號黏在一起認不出來，所以整串換掉。
+  const KEY_RULES = [
+    { re: /(?<![A-Za-z0-9_-])(sk-proj-|sk-ant-|sk-)([A-Za-z0-9_-]{12,})/g, keepPrefix: true, brand: 'OpenAI或Anthropic的API金鑰' },
+    { re: /(?<![A-Za-z0-9_-])(xoxb-)([A-Za-z0-9_-]{20,})/g, keepPrefix: true, brand: 'Slack機器人權杖' },
+    { re: /(?<![A-Za-z0-9_-])(github_pat_)([A-Za-z0-9_]{20,})/g, keepPrefix: false, brand: 'GitHub權杖' },
+    { re: /(?<![A-Za-z0-9_-])(gh[pousr]_)([A-Za-z0-9_]{20,})/g, keepPrefix: false, brand: 'GitHub權杖' },
+    { re: /(?<![A-Za-z0-9_-])(AIza)([A-Za-z0-9_-]{20,})/g, keepPrefix: false, brand: 'Google API金鑰' },
+    { re: /(?<![A-Za-z0-9_-])(AKIA)([A-Z0-9]{16})(?![A-Za-z0-9_])/g, keepPrefix: false, brand: 'AWS存取金鑰' },
+  ];
+
+  function detectKnownKeys(ctx) {
+    for (const rule of KEY_RULES) {
+      for (const m of ctx.source.matchAll(rule.re)) {
+        const wholeStart = m.index;
+        const wholeEnd = m.index + m[0].length;
+        const start = rule.keepPrefix ? wholeStart + m[1].length : wholeStart;
+        const candidate = add(ctx, {
+          start, end: wholeEnd, type: 'KEY', priority: PRIORITY.credential, confidence: '高',
+          reason: rule.keepPrefix
+            ? `開頭是「${m[1]}」，符合${rule.brand}的格式。開頭會保留，讓AI知道是哪一種金鑰（別人也看得出種類），後面整段換掉。沒有驗證金鑰是否有效。`
+            : `開頭是「${m[1]}」，符合${rule.brand}的格式，整串換掉。沒有驗證是否有效。`,
+        });
+        if (candidate) ctx.credentials.set(wholeStart + ':' + wholeEnd, candidate);
+      }
+    }
+  }
+
+  /* ---------- 規則5：JWT登入權杖 ---------- */
+  // 三段用「.」分開，前兩段用 Base64URL 解開都要是 JSON 物件。版本號 1.2.3 這種解不開，不會被當成JWT。
+  const JWT = /(?<![A-Za-z0-9_.-])([A-Za-z0-9_-]{4,})\.([A-Za-z0-9_-]{4,})\.([A-Za-z0-9_-]*)(?![A-Za-z0-9_-]|\.[A-Za-z0-9_-])/g;
+
+  function isBase64UrlJsonObject(part) {
+    if (part.length % 4 === 1) return false;
+    let b64 = part.replace(/-/g, '+').replace(/_/g, '/');
+    while (b64.length % 4) b64 += '=';
+    let decoded;
+    try {
+      decoded = atob(b64);
+    } catch {
+      return false;
+    }
+    if (!/^\s*\{/.test(decoded)) return false;
+    try {
+      const value = JSON.parse(decoded);
+      return value !== null && typeof value === 'object' && !Array.isArray(value);
+    } catch {
+      return false;
+    }
+  }
+
+  function detectJwts(ctx) {
+    for (const m of ctx.source.matchAll(JWT)) {
+      if (!isBase64UrlJsonObject(m[1]) || !isBase64UrlJsonObject(m[2])) continue;
+      add(ctx, {
+        start: m.index, end: m.index + m[0].length, type: 'TOKEN', priority: PRIORITY.credential, confidence: '中',
+        reason: '三段用「.」分開、前兩段解開是JSON，符合JWT登入權杖的格式。沒有驗證簽章或有效期限。',
+      });
+    }
+  }
+
+  /* ---------- 規則6：資料庫連線字串 ---------- */
+  // postgres://帳號:密碼@主機:埠/資料庫 只換「密碼」和「主機」，其他保留。
+  // 看不懂格式時（例如密碼裡有空白），保險起見整段遮住並提醒，不留下半個密碼。
+  const DB_URI = /(?<![A-Za-z0-9+.-])((?:postgres(?:ql)?|mysql|mariadb|mongodb)(?:\+[A-Za-z0-9]+)?):\/\//gi;
+  const HOST_ITEM = /^(?:(?:[A-Za-z0-9_](?:[A-Za-z0-9_-]*[A-Za-z0-9_])?\.)*[A-Za-z0-9_](?:[A-Za-z0-9_-]*[A-Za-z0-9_])?|\[[0-9A-Fa-f:.]+\])(?::\d{1,5})?$/;
+  const IPV4_TEXT = /^(?:\d{1,3}\.){3}\d{1,3}$/;
+
+  // 連線字串到哪裡結束：前面有引號就到成對的引號，沒有就到空白或 < >，都不跨行
+  function uriEnd(s, from, quote) {
+    let i = from;
+    while (i < s.length) {
+      const ch = s[i];
+      if (ch === '\n' || ch === '\r') break;
+      if (quote ? ch === quote : /[\s<>]/.test(ch)) break;
+      i++;
+    }
+    return i;
+  }
+
+  // 拆出帳號密碼和主機。看不懂就回傳 null。
+  function parseUri(rest) {
+    const queryAt = rest.search(/[?#]/);
+    const head = queryAt === -1 ? rest : rest.slice(0, queryAt); // 查詢參數裡的 @（例如信箱）不算
+    const slashes = [];
+    for (let i = 0; i < head.length; i++) if (head[i] === '/') slashes.push(i);
+
+    // 從最後一個 @ 往前找：@ 後面到下一個 / 是主機段，主機段要長得正常、而且裡面不能再有 @。
+    // 這樣密碼裡沒編碼的 / 或 @ 也能切對。每一段只檢查一次，所以再長的字串也很快。
+    let hostAt = -1;
+    let hosts = null;
+    let laterAt = head.length;
+    let sp = slashes.length;
+    for (let at = head.lastIndexOf('@'); at !== -1; at = at === 0 ? -1 : head.lastIndexOf('@', at - 1)) {
+      while (sp > 0 && slashes[sp - 1] > at) sp--;
+      const end = sp < slashes.length ? slashes[sp] : head.length;
+      if (laterAt >= end) { // 主機段裡沒有別的 @
+        const section = head.slice(at + 1, end);
+        if (section && section.split(',').every((part) => HOST_ITEM.test(part))) {
+          hostAt = at;
+          hosts = section;
+          break;
+        }
+      }
+      laterAt = at;
+    }
+
+    if (hostAt === -1) {
+      if (rest.includes('@')) return null; // 有 @ 卻找不到合理的主機，或密碼裡有沒編碼的 ? #：看不懂
+      const end = head.indexOf('/');
+      const section = end === -1 ? head : head.slice(0, end);
+      if (section && !section.split(',').every((part) => HOST_ITEM.test(part))) return null;
+      return { userinfo: null, hostStart: 0, hosts: section };
+    }
+    const userinfo = head.slice(0, hostAt);
+    if (/\s/.test(userinfo)) return null;
+    // 沒有密碼、後面的 ? # 裡卻還有 @：多半是密碼裡有沒編碼的 ? #，被切錯了
+    if (!userinfo.includes(':') && queryAt !== -1 && rest.indexOf('@', queryAt) !== -1) return null;
+    return { userinfo, hostStart: hostAt + 1, hosts };
+  }
+
+  function detectConnectionStrings(ctx) {
+    const s = ctx.source;
+    DB_URI.lastIndex = 0;
+    let m;
+    while ((m = DB_URI.exec(s)) !== null) {
+      const start = m.index + m[0].length;
+      const before = s[m.index - 1];
+      const quote = before === '"' || before === "'" || before === '`' ? before : null;
+      const end = uriEnd(s, start, quote);
+      DB_URI.lastIndex = Math.max(DB_URI.lastIndex, end); // 同一段不重複掃描
+      if (end === start) continue;
+
+      const parsed = parseUri(s.slice(start, end));
+      if (!parsed) {
+        ctx.uriAuthorities.push([start, end]);
+        add(ctx, {
+          start, end, type: 'SECRET', priority: PRIORITY.uri, confidence: '低',
+          reason: '資料庫連線字串的格式看不懂（例如密碼裡有空白或沒編碼的 ? #），保險起見整段遮住。',
+        });
+        warn(ctx, start, 'uri-unclear', 'notice', '這個資料庫連線字串看不出帳號、密碼和主機的範圍，已經整段遮住。需要保留其中一部分的話，請自己確認。');
+        continue;
+      }
+      // 「密碼@主機」這段不再當成信箱（帳號如果是信箱，照常偵測）；後面的路徑和查詢參數也照常檢查
+      let protectFrom = start + parsed.hostStart;
+      if (parsed.userinfo) {
+        const colon = parsed.userinfo.indexOf(':');
+        if (colon !== -1 && colon < parsed.userinfo.length - 1) {
+          const password = parsed.userinfo.slice(colon + 1);
+          const lenient = /[/@]/.test(password);
+          protectFrom = start + colon + 1;
+          add(ctx, {
+            start: start + colon + 1, end: start + parsed.userinfo.length, type: 'SECRET', priority: PRIORITY.uri,
+            confidence: lenient ? '低' : '高',
+            reason: lenient
+              ? '資料庫連線字串裡的密碼。密碼裡有沒編碼的 / 或 @，已經依主機前面的「@」切開，請確認範圍。'
+              : '資料庫連線字串裡「帳號:密碼@主機」的密碼。',
+          });
+          if (lenient) warn(ctx, start, 'uri-lenient', 'notice', '連線字串的密碼裡有沒編碼的 / 或 @，已經依主機前面的「@」切開來遮，請確認範圍對不對。');
+        }
+      }
+      ctx.uriAuthorities.push([protectFrom, start + parsed.hostStart + parsed.hosts.length]);
+
+      const parts = parsed.hosts ? parsed.hosts.split(',') : [];
+      let offset = start + parsed.hostStart;
+      let ipv6 = false;
+      for (const part of parts) {
+        let hostStart = offset;
+        let host;
+        if (part.startsWith('[')) {
+          ipv6 = true;
+          hostStart = offset + 1;
+          host = part.slice(1, part.indexOf(']'));
+        } else {
+          host = part.split(':')[0];
+        }
+        offset += part.length + 1;
+        if (/^localhost$/i.test(host) || IPV4_TEXT.test(host)) continue; // IP交給IPv4規則
+        add(ctx, {
+          start: hostStart, end: hostStart + host.length, type: 'HOST', priority: PRIORITY.uri,
+          confidence: ipv6 || parts.length > 1 ? '低' : '中',
+          reason: ipv6
+            ? '資料庫連線字串裡的IPv6主機。這一版只做基本處理，請確認。'
+            : '資料庫連線字串裡的主機名稱，可能透露公司或學校的伺服器。',
+        });
+      }
+      if (ipv6) warn(ctx, start, 'uri-ipv6', 'notice', '連線字串的主機是IPv6位址，這一版只做基本處理，請確認有沒有遮好。');
+      if (parts.length > 1) warn(ctx, start, 'uri-multi', 'notice', '連線字串裡有好幾個主機，這一版只做基本處理，請確認每個主機都遮到了。');
+    }
+  }
+
+  /* ---------- 規則7：敏感欄位後面的值 ---------- */
+  // password = "…"、DB_PASSWORD=…、"apiKey": "…"、password := "…"、'password' => '…'、config["password"] = "…"、
+  // password: str = "…"、Authorization: Bearer …
+  // 欄位名稱會先統一成小寫加底線（apiKey → api_key），再看結尾是不是敏感字。
+  const SECRET_WORDS = [
+    'password', 'passwords', 'passwd', 'pwd', 'pass', 'passphrase',
+    'secret', 'secrets', 'client_secret', 'client_secrets', 'secret_key', 'secret_key_base',
+    'token', 'access_token', 'refresh_token', 'id_token', 'auth_token', 'api_token', 'bearer_token', 'session_token',
+    'access_tokens', 'refresh_tokens', 'auth_tokens', 'api_tokens', 'session_tokens',
+    'api_key', 'api_keys', 'apikey', 'access_key', 'access_keys', 'private_key', 'private_keys', 'secret_access_key',
+    'credential', 'credentials', 'authorization', 'auth',
+  ];
+  // 這幾個字很明確，前面黏著別的字也算（PGPASSWORD、GITHUBTOKEN）
+  const STRONG_SUFFIXES = ['password', 'passwd', 'passphrase', 'secret', 'token', 'apikey'];
+  // 只有整個名稱就是這個字才算：tokens 多半是一組權杖，但 max_tokens、total_tokens 是用量的數字
+  const EXACT_WORDS = ['tokens'];
+
+  function normalizeKey(key) {
+    return key.replace(/([a-z0-9])([A-Z])/g, '$1_$2').replace(/[-.]+/g, '_').toLowerCase();
+  }
+
+  function isSecretKey(key) {
+    const k = normalizeKey(key);
+    return SECRET_WORDS.some((word) => k === word || k.endsWith('_' + word))
+      || STRONG_SUFFIXES.some((word) => k.endsWith(word))
+      || EXACT_WORDS.includes(k);
+  }
+
+  function isAuthorizationKey(key) {
+    const k = normalizeKey(key);
+    return k === 'authorization' || k.endsWith('_authorization');
+  }
+
+  // 欄位名稱＋分隔符號。名稱可以有引號（字串裡的 JSON 會是 \"password\"，從表格轉出來的可能是 "Password "），
+  // 也可以是 config["password"] 這種寫法。有引號的名稱後面可以換行（JSON 允許）。
+  // m[1] 引號、m[2]／m[3] 有引號／沒引號的名稱、m[4] 右中括號（前面可以有空白：config[ "password" ]）、
+  // m[5]／m[7] 分隔符號前後的空白、m[6] 分隔符號。
+  // 分隔符號也包含比對（==、===、!=、!==）：if password == "1234" 裡的字串多半就是寫死的密碼。
+  const FIELD = /(?<![A-Za-z0-9_.])(?:((?:\\{1,7})?["'])[ \t]{0,3}([A-Za-z_][A-Za-z0-9_.-]{0,63})[ \t]{0,3}\1|([A-Za-z_][A-Za-z0-9_.-]{0,63}))((?:[ \t]*\])?)((?<=["'\]])\s*|[ \t]*)(:=|=>|[!=]==?(?!=)|:(?![:=])|=(?!=))([ \t]*)/g;
+  // 某個位置開始是不是另一個欄位：有引號的 "user": 或 user=，沒引號的冒號後面要接空白或行尾（避免把 https: 當成欄位）
+  const KEY_AHEAD = /(?:(["'])[ \t]{0,3}[A-Za-z_][A-Za-z0-9_.-]{0,63}[ \t]{0,3}\1[ \t]*(?::=|=>|:(?![:=])|=(?!=))|[A-Za-z_][A-Za-z0-9_.-]{0,63}[ \t]*(?::=|=>|=(?!=)|:(?=[ \t\r\n]|$)))/y;
+  const INLINE_VALUE = /[^\s,;'"`)\]}&]+/y; // 一行中間的值：到空白或標點為止
+  const PREFIX_WORD = /(?:export|set|env|arg)[ \t]+/iy; // 行首的宣告：export DB_PASSWORD=…
+  const PREFIX_DASH = /-[ \t]+/y; // YAML 清單的「- password: …」
+  const UPPER_ENV = /^[A-Z][A-Z0-9_]*$/; // 大寫的環境變數名稱
+  const NOT_A_SECRET = /^(?:None|null|nil|true|false|True|False|undefined|NaN|required|optional|string|str|number|int|integer|float|double|bool|boolean|bytes|any|unknown|object|void|String|Number|Boolean|Object|Any)$/;
+  const CODE_EXPRESSION = /^[A-Za-z_$][\w$.]*(?:\(.*\)|\[.*\])$/; // get_pw()、os.environ["PW"]
+  // 一行中間的函式呼叫或取值的開頭：getToken(、await jwt.sign(、new Token(、tokens[
+  const CODE_CALL = /(?:(?:await|new|yield)[ \t]+)*[A-Za-z_$][\w$.]*[([]/y;
+  const CODE_KEYWORD = /^(?:await|new|yield|typeof|void|lambda|not)$/;
+  const PLACEHOLDER = /^(?:<[^<>]*>|\{\{.*\}\}|\$\{\{.*\}\}|[*xX.…]+)$/; // <your-password>、{{ secret }}、****
+  // Authorization 後面的佔位：$TOKEN、${TOKEN}、$(cat token)、%TOKEN%、<token>、{{ token }}、{token}
+  const AUTH_PLACEHOLDER = /^(?:\$\{?[A-Za-z_]\w*\}?|\$\(.*\)|%[A-Za-z_]\w*%|<[^<>]*>|\{\{.*\}\}|\{[A-Za-z_][\w.]*\})$/;
+  const AUTH_SCHEME = /^(?:Bearer|Basic|Token|Bot|Digest|ApiKey)$/i;
+  const NUMBER = /^-?\d+(?:\.\d+)?$/;
+  // 型別標註：password: str = …、token: string = …、pw: &str = …、secret: Optional[str] = …
+  const TYPE_ANNOTATION = /(?:&(?:'[a-z]+[ \t]+)?)?(?:str|string|bytes|int|[A-Z][\w.]*(?:<[^<>\n]{0,40}>|\[[^[\]\n]{0,40}\])?)\??[ \t]+=(?![=>])[ \t]*/y;
+  // Go 的宣告：var password string = "…"
+  const GO_DECLARATION = /(?<![\w.])(?:var|const)[ \t]+([A-Za-z_]\w*)[ \t]+[*[\]\w.]+[ \t]*=(?!=)[ \t]*/g;
+  // 名稱和值都當成參數的呼叫：讀設定時的預設值 os.getenv("DB_PASSWORD", "…")、os.environ.get("SECRET_KEY", "…")，
+  // 以及寫入設定 define('DB_PASSWORD', '…')、props.setProperty("password", "…")、setItem("token", "…")
+  const GETTER = /(?<![\w$])(?:getenv|get|env|setdefault|getProperty|GetEnvironmentVariable|define|set|put|setItem|setProperty|setenv|setHeader|append)[ \t]*\(\s*(["'])([^"'\\\n]{1,80})\1\s*,/g;
+  // 字串裡的格式化佔位：%s、%(pw)s、{}、{0}、{pw}
+  const FORMAT_SLOT = /%(?:\([^()\n]{1,40}\))?[-#0 +]*\d*(?:\.\d+)?[sdirfxXeEgGc]|\{[\w.]{0,40}(?:![rsa])?(?::[^{}\n]{0,20})?\}/g;
+  const FORMAT_SLOT_AT = new RegExp(FORMAT_SLOT.source, 'y'); // 這個位置是不是佔位
+  // YAML 多行值的標記：|、>、|-、>+、|2，前面可以有 !標籤 或 &錨點（例如 !vault |）
+  const YAML_BLOCK = /^(?:[!&]\S*[ \t]+)*[|>](?:[-+][1-9]?|[1-9][-+]?)?$/;
+  const YAML_KEY_LINE = /^[ \t]*(?:-[ \t]+)?["']?[A-Za-z_][\w.-]*["']?[ \t]*:(?:[ \t]|$)/;
+
+  const MAX_VALUE_LINES = 200; // 跨行的值（三引號、反引號、陣列、YAML）最多看幾行；值寫在下一行時，中間的空行和註解行最多也跳過這麼多
+  const SCAN_LIMIT = 2000; // 判斷括號、呼叫範圍時，同一行最多往後看幾個字；再長多半是壓縮過的程式，不再細看
+
+  const isBlank = (ch) => ch === ' ' || ch === '\t';
+  const isBreak = (ch) => ch === '\n' || ch === '\r';
+
+  function skipBlanks(s, i) {
+    while (i < s.length && isBlank(s[i])) i++;
+    return i;
+  }
+
+  function lineEndAt(s, i) {
+    while (i < s.length && !isBreak(s[i])) i++;
+    return i;
+  }
+
+  // 範圍結尾往前去掉空白；trimPunctEnd 再去掉逗號、分號。用迴圈，避免很長的字串讓正規表達式變慢。
+  function trimBlankEnd(s, a, b) {
+    while (b > a && isBlank(s[b - 1])) b--;
+    return b;
+  }
+
+  function trimPunctEnd(s, a, b) {
+    while (b > a && ' \t,;'.includes(s[b - 1])) b--;
+    return b;
+  }
+
+  // 程式寫法的值結尾：去掉逗號、分號，以及沒有成對的右括號（JSON 的 123456}、get_pw()},）。
+  // 先數好整段的括號，再從結尾往前拿掉，不重複掃描。
+  function trimCodeEnd(s, a, b) {
+    const pairs = { ')': '(', ']': '[', '}': '{' };
+    const count = { '(': 0, '[': 0, '{': 0, ')': 0, ']': 0, '}': 0 };
+    for (let i = a; i < b; i++) if (s[i] in count) count[s[i]]++;
+    for (;;) {
+      b = trimPunctEnd(s, a, b);
+      const ch = s[b - 1];
+      if (b <= a || !(ch in pairs) || count[ch] <= count[pairs[ch]]) return b;
+      count[ch]--;
+      b--;
+    }
+  }
+
+  // 一行裡的註解（空白後面接 #）從哪裡開始，沒有就回傳 to
+  function commentAt(s, from, to) {
+    for (let i = from + 1; i < to; i++) if (s[i] === '#' && isBlank(s[i - 1])) return i - 1;
+    return to;
+  }
+
+  // 這個位置開始是不是註解（# 或 //）
+  const isCommentAt = (s, i) => s[i] === '#' || (s[i] === '/' && s[i + 1] === '/');
+
+  // 這個位置所在的那一行在哪裡結束（用行首表查，不用一個字一個字找）
+  function lineEndOf(ctx, pos) {
+    const s = ctx.source;
+    const line = lineOf(ctx.lineStarts, pos).line;
+    if (line >= ctx.lineStarts.length) return s.length;
+    let end = ctx.lineStarts[line];
+    if (s[end - 1] === '\n') end--;
+    if (s[end - 1] === '\r') end--;
+    return end;
+  }
+
+  // 這個位置所在那一行的縮排
+  function indentOf(ctx, pos) {
+    const start = ctx.lineStarts[lineOf(ctx.lineStarts, pos).line - 1];
+    return skipBlanks(ctx.source, start) - start;
+  }
+
+  // 陣列或物件換行後，下一行如果是縮排沒有比較深的「名稱:」，代表前面的括號沒有關上，已經到了下一個欄位
+  function reachedNextField(ctx, breakAt, baseIndent) {
+    const s = ctx.source;
+    const start = breakAt + (s[breakAt] === '\r' && s[breakAt + 1] === '\n' ? 2 : 1);
+    const pos = skipBlanks(s, start);
+    return pos - start <= baseIndent && pos < s.length && !isBreak(s[pos]) && isKeyAt(s, pos);
+  }
+
+  // 從這個位置開始的行（含）往後 MAX_VALUE_LINES 行，到哪裡結束
+  function windowEnd(ctx, from) {
+    const last = lineOf(ctx.lineStarts, from).line + MAX_VALUE_LINES - 1;
+    return last < ctx.lineStarts.length ? ctx.lineStarts[last] : ctx.source.length;
+  }
+
+  const isKeyAt = (s, i) => {
+    KEY_AHEAD.lastIndex = i;
+    return KEY_AHEAD.test(s);
+  };
+
+  // 引號字串後面緊接著冒號或等號：這個字串其實是下一個欄位的名稱（"user": …）
+  function isKeyAfter(s, i) {
+    const k = skipBlanks(s, i);
+    return (s[k] === ':' && s[k + 1] !== ':') || (s[k] === '=' && s[k + 1] !== '=');
+  }
+
+  // YAML 清單的「- 」
+  const isDashItem = (s, i) => s[i] === '-' && (i + 1 >= s.length || isBlank(s[i + 1]) || isBreak(s[i + 1]));
+
+  // YAML：這一行是「名稱: 值」（巢狀物件），不是純文字。YAML 的純文字裡不會有「: 」。
+  function isYamlMapping(s, from) {
+    const end = lineEndAt(s, from);
+    const stop = commentAt(s, from, end);
+    for (let i = from; i < stop; i++) {
+      if (s[i] === ':' && (i + 1 >= stop || isBlank(s[i + 1]))) return true;
+    }
+    return false;
+  }
+
+  // 欄位名稱前面這一行的開頭在哪裡：只有空白，或 export／set／env／arg 這類宣告，或 YAML 清單的「- 」。
+  // 同一行的結果記在 memo，同一行有很多欄位時不用重算。
+  function lineHeads(ctx, lineStart, memo) {
+    if (memo.headLine === lineStart) return memo.heads;
+    const s = ctx.source;
+    const first = skipBlanks(s, lineStart);
+    const heads = [first];
+    PREFIX_WORD.lastIndex = first;
+    if (PREFIX_WORD.test(s)) heads.push(PREFIX_WORD.lastIndex);
+    PREFIX_DASH.lastIndex = first;
+    if (PREFIX_DASH.test(s)) heads.push(PREFIX_DASH.lastIndex);
+    memo.headLine = lineStart;
+    memo.heads = heads;
+    return heads;
+  }
+
+  // 欄位名稱是不是在字串裡（例如 "Enter password:"、log("token=%s", …)）：
+  // 從這一行開頭往後走到名稱的位置，看是不是停在某個字串裡面。字串裡的另一種引號、跳脫的引號都不算；
+  // 三引號當成一個；英文縮寫的撇號（it's、don't）不算。
+  // 同一行往後掃描時接著上次的位置繼續走，不重頭來。值跨到後面的行時，那一行從值的結尾開始（見 restartQuotes）。
+  function enclosingQuote(ctx, at, lineStart, memo) {
+    const s = ctx.source;
+    if (memo.quoteLine !== lineStart || memo.quotePos > at) restartQuotes(memo, lineStart, lineStart);
+    let i = memo.quotePos;
+    for (; i < at; i++) {
+      const ch = s[i];
+      if (memo.inQuote) {
+        if (ch === '\\') i++;
+        else if (s.startsWith(memo.inQuote, i)) {
+          i += memo.inQuote.length - 1;
+          memo.inQuote = '';
+        }
+        continue;
+      }
+      if (ch !== '"' && ch !== "'" && ch !== '`') continue;
+      if (s[i - 1] === '\\' || (ch === "'" && isWordChar(s[i - 1]) && isWordChar(s[i + 1]))) continue;
+      memo.inQuote = ch !== '`' && s[i + 1] === ch && s[i + 2] === ch ? ch.repeat(3) : ch;
+      i += memo.inQuote.length - 1;
+      memo.openEnd = i; // 開頭引號的最後一個字
+    }
+    memo.quotePos = Math.max(i, at);
+    return memo.inQuote ? { quote: memo.inQuote[0], open: memo.openEnd } : null;
+  }
+
+  function restartQuotes(memo, lineStart, pos) {
+    memo.quoteLine = lineStart;
+    memo.quotePos = pos;
+    memo.inQuote = '';
+    memo.openEnd = -1;
+  }
+
+  // 有引號的值。parts 是要遮的範圍：一般只有一段；跨行時每一行一段（不含開頭縮排）。
+  // - 一般引號要在同一行結束。認得 \" 這種跳脫；連續兩個引號（YAML、SQL 的 ''，或 Python 相鄰的字串）算在字串裡。
+  // - 三引號（Python 的 """、'''）和反引號（JavaScript 樣板字串、Go）可以跨行，最多 MAX_VALUE_LINES 行。
+  // 找不到結尾時 closed 是 false，只回傳第一行（遮到行尾）。
+  function readQuoted(s, from) {
+    let p = from;
+    const prefix = /^[rRbBfFuU]{1,2}(?=["'])/.exec(s.slice(from, from + 3)); // Python 的 r"…"、b'…'
+    if (prefix) p += prefix[0].length;
+    const quote = s[p];
+    if (quote !== '"' && quote !== "'" && quote !== '`') return null;
+    const triple = quote !== '`' && s.startsWith(quote.repeat(3), p);
+    const close = triple ? quote.repeat(3) : quote;
+    const canSpan = triple || quote === '`';
+    const firstStart = p + close.length;
+    const parts = [];
+    let partStart = firstStart;
+    let firstEnd = -1;
+    let lines = 1;
+    let j = firstStart;
+    while (j < s.length) {
+      const ch = s[j];
+      if (isBreak(ch)) {
+        if (firstEnd === -1) firstEnd = j;
+        if (!canSpan || lines >= MAX_VALUE_LINES) break;
+        parts.push([partStart, trimBlankEnd(s, partStart, j)]);
+        j += ch === '\r' && s[j + 1] === '\n' ? 2 : 1;
+        lines++;
+        j = skipBlanks(s, j); // 下一行的縮排不遮，保持排版
+        partStart = j;
+        continue;
+      }
+      if (ch === '\\' && j + 1 < s.length && !isBreak(s[j + 1])) {
+        j += 2; // 跳過 \" 或 \\
+        continue;
+      }
+      if (s.startsWith(close, j)) {
+        if (!canSpan && s[j + 1] === quote) {
+          j += 2; // '' 或 ""：還在同一個字串裡
+          continue;
+        }
+        // 三引號、反引號後面緊接著英數字：多半是下一段字串的開頭，不是結尾（例如連續兩個沒關上的三引號）
+        if (canSpan && isWordChar(s[j + close.length])) break;
+        parts.push([partStart, j]);
+        return { parts: parts.filter(([a, b]) => b > a), closed: true, scanEnd: j + close.length, lines, triple, quote, open: p };
+      }
+      j++;
+    }
+    if (firstEnd === -1) firstEnd = lineEndAt(s, firstStart);
+    return {
+      parts: firstEnd > firstStart ? [[firstStart, firstEnd]] : [],
+      closed: false, scanEnd: firstEnd, lines, triple, quote, open: p,
+    };
+  }
+
+  // 字串裡的 JSON（例如記錄檔的 "{\"password\": \"abc\"}"）：值從 \" 開始，到同一層的 \" 結束。
+  // 包了好幾層的（\\\"）也認得：開頭有 k 個反斜線（1、3、7），結尾也要是同一層。
+  // 比同一層多的反斜線加引號是裡面那層的跳脫引號；比較少（或沒有）代表外層字串已經結束。
+  function readEscapedQuoted(s, from) {
+    let k = 0;
+    while (s[from + k] === '\\') k++;
+    const quote = s[from + k];
+    const level = [1, 3, 7].indexOf(k);
+    if (level === -1 || (quote !== '"' && quote !== "'")) return null;
+    const cycle = 2 ** (level + 2); // 1 個反斜線看除以 4 的餘數，3 個看除以 8，7 個看除以 16
+    const start = from + k + 1;
+    let j = start;
+    while (j < s.length && !isBreak(s[j]) && s[j] !== quote) {
+      if (s[j] !== '\\') {
+        j++;
+        continue;
+      }
+      let e = j;
+      while (s[e] === '\\') e++;
+      if (s[e] !== quote) {
+        j = e;
+        continue;
+      }
+      const rest = (e - j) % cycle;
+      if (rest === k) {
+        return { parts: e - k > start ? [[start, e - k]] : [], closed: true, scanEnd: e + 1, lines: 1, open: from, quote };
+      }
+      if (rest !== cycle - 1) {
+        j = e; // 外層字串結束
+        break;
+      }
+      j = e + 1; // 裡面那層的跳脫引號
+    }
+    return { parts: j > start ? [[start, j]] : [], closed: false, scanEnd: j, lines: 1, open: from, quote };
+  }
+
+  // 這個位置開始的字串：一般的引號，或字串裡的 JSON 用的 \"。不是字串回傳 null。
+  function quotedAt(s, i) {
+    const ch = s[i];
+    if (ch === '"' || ch === "'" || ch === '`') return readQuoted(s, i);
+    return ch === '\\' ? readEscapedQuoted(s, i) : null;
+  }
+
+  // 沒引號的值。mode：
+  //   line  ＝整行剩下的部分（YAML、INI、.properties），到行尾或 # 註解
+  //   shell ＝命令列的寫法，到沒有跳脫的空白為止（a\ b 算同一個值）；結尾的分號是命令分隔
+  //   inline＝一行中間，到空白或標點為止
+  function readUnquoted(s, from, mode, memo) {
+    if (mode === 'line') {
+      const lineEnd = lineEndAt(s, from);
+      const end = trimBlankEnd(s, from, commentAt(s, from, lineEnd));
+      // coreEnd：再去掉行尾的逗號、分號和沒有成對的右括號。值看起來是程式寫法時才用它（見 maskUnquoted）
+      return { start: from, end, coreEnd: trimCodeEnd(s, from, end), scanEnd: lineEnd };
+    }
+    if (mode === 'shell') {
+      let stop = from;
+      while (stop < s.length && !/\s/.test(s[stop])) {
+        stop += s[stop] === '\\' && stop + 1 < s.length && !isBreak(s[stop + 1]) ? 2 : 1;
+      }
+      if (stop === from) return null;
+      let end = stop;
+      while (end > from && s[end - 1] === ';') end--;
+      return { start: from, end, scanEnd: stop };
+    }
+    // 一行中間：同一段沒有標點的文字，結尾位置都一樣，記下來就不用重複掃描
+    let end;
+    if (memo && from > memo.runStart && from < memo.runEnd) {
+      end = memo.runEnd;
+    } else {
+      INLINE_VALUE.lastIndex = from;
+      const m = INLINE_VALUE.exec(s);
+      if (!m) return null;
+      end = from + m[0].length;
+      if (memo) {
+        memo.runStart = from;
+        memo.runEnd = end;
+      }
+    }
+    return { start: from, end, scanEnd: end };
+  }
+
+  // 值是「{」開頭時，是不是真的物件。{"user": …}、{a, b}、{} 是物件，裡面的欄位交給一般掃描；
+  // {SSHA}abc、{noop}abc、{abc}、{{ secret }} 這種是值本身。
+  // 沒有在同一行結束的：「{」後面沒有東西（或只有註解），或已經出現「名稱: 值」，才當成跨行的物件；{abc 這種是值。
+  function braceIsObject(s, from) {
+    let depth = 0;
+    let i = from;
+    while (i < s.length && !isBreak(s[i])) {
+      if (i - from > SCAN_LIMIT) return true; // 太長看不完：當成物件，交給一般掃描
+      const ch = s[i];
+      const q = quotedAt(s, i);
+      if (q) {
+        if (q.lines > 1) return true; // 物件裡有跨行的字串（JavaScript 的樣板字串）
+        if (!q.closed) return false;
+        i = q.scanEnd;
+        continue;
+      }
+      if (ch === '{') depth++;
+      else if (ch === '}' && --depth === 0) break;
+      else if (depth === 1 && (ch === ':' || ch === '=' || ch === ',')) return true; // 已經有「名稱: 值」
+      i++;
+    }
+    if (i >= s.length || isBreak(s[i])) { // 這一行沒有結束
+      const next = skipBlanks(s, from + 1);
+      return next >= s.length || isBreak(s[next]) || isCommentAt(s, next);
+    }
+    const after = skipBlanks(s, i + 1);
+    if (after < s.length && !isBreak(s[after]) && !',;)]}'.includes(s[after]) && !isCommentAt(s, after)) return false; // 後面還接著值：{SSHA}abc
+    return i === from + 1; // {} 是空物件；{abc} 是值
+  }
+
+  // 從 { 開始找對應的 }（認得引號和巢狀括號），最多看 MAX_VALUE_LINES 行。找不到回傳 -1。
+  // 算過的結果記在 memo.objects：同一行開始的括號看的範圍一樣，可以共用，避免重複掃描。
+  // strict：只看括號配對，不因為下一行沒有縮排就停（JSON 換行但沒縮排的寫法），結果另外記在 memo.strictObjects
+  function skipObject(ctx, from, memo, strict = false) {
+    const seen = strict ? memo.strictObjects : memo.objects;
+    const known = seen.get(from);
+    if (known !== undefined) return known;
+    const s = ctx.source;
+    const limit = windowEnd(ctx, from);
+    const firstLineEnd = lineEndOf(ctx, from);
+    const baseIndent = indentOf(ctx, from);
+    const stack = [];
+    let i = from;
+    while (i < limit) {
+      const ch = s[i];
+      const q = quotedAt(s, i);
+      if (q) {
+        if (!q.closed) break;
+        i = q.scanEnd;
+        continue;
+      }
+      if (!strict && isBreak(ch) && reachedNextField(ctx, i, baseIndent)) break;
+      if (ch === '{' || ch === '[') {
+        stack.push(i);
+      } else if (ch === '}' || ch === ']') {
+        const open = stack.pop();
+        seen.set(open, i + 1);
+        if (!stack.length) return i + 1;
+      }
+      i++;
+    }
+    // strict 找不到結尾時，這次掃過的括號都記成找不到（後面開始的範圍比較遠，當成找不到是保守的結果），避免重複掃描
+    for (const open of stack) if (strict || open < firstLineEnd) seen.set(open, -1);
+    return -1;
+  }
+
+  // 陣列：["a", "b"]、[a, b]、[["a"]]，可以跨行（最多 MAX_VALUE_LINES 行）。
+  // 裡面的物件整個跳過（物件裡的欄位交給一般掃描），objectAt 記下第一個物件的位置。
+  function readArray(ctx, from, memo) {
+    const s = ctx.source;
+    const limit = windowEnd(ctx, from);
+    const items = [];
+    // 沒引號的項目：每一行各自去掉前後空白
+    const pushPlain = (a, b) => {
+      let k = a;
+      while (k < b) {
+        let e = k;
+        while (e < b && !isBreak(s[e])) e++;
+        const x = Math.min(skipBlanks(s, k), e);
+        const y = trimBlankEnd(s, x, e);
+        if (y > x) items.push({ start: x, end: y, quoted: false });
+        k = e + 1;
+      }
+    };
+    const unclosed = () => ({ items, closed: false, scanEnd: lineEndOf(ctx, from), objectAt });
+    const baseIndent = indentOf(ctx, from);
+    let objectAt = -1;
+    let depth = 1;
+    let itemStart = from + 1;
+    let i = from + 1;
+    while (i < limit) {
+      const ch = s[i];
+      if (isBreak(ch) && reachedNextField(ctx, i, baseIndent)) {
+        if (itemStart !== -1) pushPlain(itemStart, i);
+        return unclosed();
+      }
+      if (ch === '{') {
+        if (itemStart !== -1) pushPlain(itemStart, i);
+        if (objectAt === -1) objectAt = i;
+        // 陣列裡的物件：先照縮排找；JSON 換行沒縮排時（[{ 換行 "user": …），改成只看括號配對
+        let end = skipObject(ctx, i, memo);
+        if (end === -1) end = skipObject(ctx, i, memo, true);
+        if (end === -1) return unclosed();
+        i = end;
+        itemStart = -1;
+        continue;
+      }
+      const q = quotedAt(s, i);
+      if (q) {
+        for (const [a, b] of q.parts) items.push({ start: a, end: b, quoted: true });
+        if (!q.closed) return unclosed();
+        i = q.scanEnd;
+        itemStart = -1;
+        continue;
+      }
+      if (ch === '[') {
+        if (itemStart !== -1) pushPlain(itemStart, i);
+        depth++;
+        itemStart = i + 1;
+      } else if (ch === ']') {
+        if (itemStart !== -1) pushPlain(itemStart, i);
+        itemStart = -1;
+        depth--;
+        if (depth === 0) return { items, closed: true, scanEnd: i + 1, objectAt };
+      } else if (ch === ',') {
+        if (itemStart !== -1) pushPlain(itemStart, i);
+        itemStart = i + 1;
+      }
+      i++;
+    }
+    if (itemStart !== -1) pushPlain(itemStart, i);
+    return unclosed();
+  }
+
+  // YAML 的多行值（password: |）：把下面縮排比較深的每一行各自遮住。行尾的逗號、分號也是值的一部分。
+  function readYamlBlock(ctx, keyIndex) {
+    const s = ctx.source;
+    const lineNo = lineOf(ctx.lineStarts, keyIndex).line;
+    const keyColumn = keyIndex - ctx.lineStarts[lineNo - 1]; // 「- password: |」的欄位從第3個字開始
+    const rows = [];
+    let blockIndent = -1;
+    let scanEnd = keyIndex;
+    for (let n = lineNo; n < ctx.lineStarts.length; n++) {
+      const lineStart = ctx.lineStarts[n];
+      const lineEnd = lineEndAt(s, lineStart);
+      const first = skipBlanks(s, lineStart);
+      if (first >= lineEnd) continue;
+      const indent = first - lineStart;
+      // 第一行決定這個區塊的縮排。之後縮排變淺：退到欄位那一層或是另一個欄位（例如同一層的 user:）就結束，
+      // 其他比欄位深的行還算在區塊裡，寧可多遮也不要漏
+      if (blockIndent === -1) {
+        if (indent <= keyColumn) break;
+        blockIndent = indent;
+      } else if (indent < blockIndent && (indent <= keyColumn || YAML_KEY_LINE.test(s.slice(lineStart, lineEnd)))) {
+        break;
+      }
+      rows.push({ start: first, end: trimBlankEnd(s, first, lineEnd) });
+      scanEnd = lineEnd;
+    }
+    return { rows, scanEnd };
+  }
+
+  // 沒引號的值看起來像變數或參照（$VAR、%VAR%、config.password、程式裡的變數），也可能是真的密碼
+  function looksLikeReference(text, codeSeparator) {
+    return /^[$%]/.test(text)
+      || /^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+$/.test(text)
+      || (codeSeparator && /^[A-Za-z_]\w*$/.test(text));
+  }
+
+  // 值看起來是程式寫法（數字、型別、變數、函式呼叫），行尾的逗號、分號就是程式的標點
+  function isCodeLike(text, codeSeparator) {
+    return NUMBER.test(text) || NOT_A_SECRET.test(text) || PLACEHOLDER.test(text)
+      || CODE_EXPRESSION.test(text) || looksLikeReference(text, codeSeparator);
+  }
+
+  function addSecret(ctx, start, end, confidence, reason) {
+    return add(ctx, { start, end, type: 'SECRET', priority: PRIORITY.field, confidence, reason });
+  }
+
+  // 同一段已經被「已知開頭的金鑰」抓到：把理由合併過去，不重複列
+  function mergeIntoKnownKey(ctx, start, end, key) {
+    const same = ctx.credentials.get(start + ':' + end);
+    if (same) same.reasons.push(`也出現在「${key}」後面。`);
+    return !!same;
+  }
+
+  // 這個位置是不是接字串的運算子：+、.（PHP）、\（Python 的換行接續）；括號裡的逗號也算（Python 的 tuple）
+  function joinOperatorEnd(s, i, inParens) {
+    if (s[i] === '+' || s[i] === '\\' || (inParens && s[i] === ',')) return i + 1;
+    if (s[i] === '.' && s[i + 1] !== '.' && !isWordChar(s[i + 1])) return i + 1;
+    return -1;
+  }
+
+  // 下一行開頭的字串是不是上一段的延續：字串後面接著逗號、右括號、運算子或行尾（Python 括號裡隱含的相接）
+  function endsLikeContinuation(s, q) {
+    if (!q || !q.closed || isKeyAfter(s, q.scanEnd)) return false;
+    const k = skipBlanks(s, q.scanEnd);
+    return k >= s.length || isBreak(s[k]) || ',)]};+.\\"\'`'.includes(s[k]) || isCommentAt(s, k);
+  }
+
+  // 接在一起的字串，每一段都遮：
+  //   同一行：'abc' 'def'、"abc" + "def"、'abc' . 'def'、"abc" + name + "def"
+  //   跨行：行尾或下一行開頭有 + . \，或是在括號裡；中間可以夾 # 或 // 註解
+  //   下一行只有一個字串、後面接逗號或右括號：Python 括號裡隱含的相接
+  function joinStrings(ctx, q, inParens) {
+    const s = ctx.source;
+    const parts = q.parts.slice();
+    let scanEnd = q.scanEnd;
+    let pieces = 1;
+    let needOperator = false;
+    for (let guard = 0; guard < 2000; guard++) {
+      let i = skipBlanks(s, scanEnd);
+      let operator = false;
+      const opEnd = joinOperatorEnd(s, i, inParens);
+      if (opEnd !== -1) {
+        operator = true;
+        i = skipBlanks(s, opEnd);
+      } else if (needOperator) {
+        break;
+      }
+      if (isCommentAt(s, i)) i = lineEndAt(s, i);
+      if (i >= s.length || isBreak(s[i])) {
+        const next = nextContentLine(ctx, lineOf(ctx.lineStarts, Math.min(i, s.length)).line);
+        if (!next) break;
+        let j = next.pos;
+        const leadEnd = joinOperatorEnd(s, j, false);
+        if (leadEnd !== -1 && s[j] !== '\\') {
+          operator = true; // 運算子寫在下一行開頭
+          j = skipBlanks(s, leadEnd);
+        }
+        if (!operator && !inParens && !endsLikeContinuation(s, readQuoted(s, j))) break;
+        i = j;
+      }
+      const more = readQuoted(s, i);
+      if (more && more.closed) {
+        if (isKeyAfter(s, more.scanEnd)) break; // 下一個欄位："user": …
+        parts.push(...more.parts);
+        scanEnd = more.scanEnd;
+        pieces++;
+        needOperator = false;
+        continue;
+      }
+      // "abc" + name + "def"：中間的變數不遮，跳過去繼續找後面的字串
+      if (operator && /[A-Za-z_$]/.test(s[i] || '')) {
+        let k = i;
+        while (k < s.length && /[\w$.]/.test(s[k])) k++;
+        scanEnd = k;
+        needOperator = true;
+        continue;
+      }
+      break;
+    }
+    return { parts, scanEnd, pieces };
+  }
+
+  // 有引號的值（可能跨行，也可能是幾段接起來的字串）
+  function maskQuoted(ctx, field, q, nextLine, inParens = false) {
+    const s = ctx.source;
+    let parts = q.parts;
+    let scanEnd = q.scanEnd;
+    let joined = false;
+    // 外面還包著一層字串時（SQL 的 "… WHERE password = 'abc'"）不往後接：後面是外層字串的結尾
+    if (q.closed && !field.inString) {
+      const all = joinStrings(ctx, q, inParens);
+      parts = all.parts;
+      scanEnd = all.scanEnd;
+      joined = all.pieces > 1;
+      // 結尾引號後面直接黏著文字（命令列的 "abc"def 會接成同一個值）：一起遮
+      if (isWordChar(s[scanEnd])) {
+        let e = scanEnd;
+        while (e < s.length && !/[\s,;)\]}]/.test(s[e])) e++;
+        parts = parts.concat([[scanEnd, e]]);
+        scanEnd = e;
+      }
+    }
+    parts = parts.slice();
+    // Authorization: "Bearer xxx"、"Bearer " + "xxx" 只遮 xxx；{{token}}、$TOKEN 這種只是佔位
+    if (isAuthorizationKey(field.key) && parts.length) {
+      const [a, b] = parts[0];
+      const scheme = /^(?:Bearer|Basic|Token|Bot|Digest|ApiKey)(?:[ \t]+|$)/i.exec(s.slice(a, b));
+      if (scheme) parts[0] = [a + scheme[0].length, b];
+      if (parts.length === 1 && AUTH_PLACEHOLDER.test(s.slice(parts[0][0], b))) return null;
+    }
+    // "<your-password>"、"****" 這種佔位文字不遮
+    if (q.closed && parts.length === 1 && PLACEHOLDER.test(s.slice(parts[0][0], parts[0][1]))) return scanEnd;
+    if (!q.closed) {
+      const spanning = q.triple || q.quote === '`';
+      warn(ctx, q.open, spanning ? 'unclosed-multiline' : 'unclosed-quote', 'confirm', spanning
+        ? `「${field.key}」後面的${q.triple ? '三引號' : '反引號'}字串找不到結尾（最多往下看${MAX_VALUE_LINES}行），只遮了第一行。`
+        : `「${field.key}」後面的字串找不到結尾引號，已先遮到這一行結尾，請確認範圍對不對。`, {
+        risk: spanning ? '後面幾行如果還是這個值的一部分，會原樣送出。' : '如果這個值延續到下一行，下一行的內容沒有遮。',
+        fix: '在原文補上結尾的引號後重新掃描；確定值只到這一行的話，可以勾選確認後複製。',
+      });
+    }
+    const live = parts.filter(([a, b]) => b > a);
+    if (!live.length) return scanEnd;
+    if (live.length === 1 && mergeIntoKnownKey(ctx, live[0][0], live[0][1], field.key)) return scanEnd;
+
+    const where = nextLine ? `「${field.key}」下一行的` : `出現在「${field.key}」後面的`;
+    let reason;
+    if (!q.closed) reason = `出現在「${field.key}」後面，但找不到結尾的引號，先遮到這一行結尾。`;
+    else if (q.lines > 1) reason = `${where}${q.triple ? '三引號' : '反引號'}字串跨了${q.lines}行，每一行分開遮，縮排不動。`;
+    else if (joined || live.length > 1) reason = `${where}${inParens ? '括號裡有幾段字串' : '字串是幾段接在一起的'}，每一段都遮。`;
+    else if (field.compare) reason = `程式拿「${field.key}」和這個字串比對，這多半是寫死在程式裡的密碼。`;
+    else reason = `${nextLine ? `「${field.key}」的值寫在下一行。` : `出現在「${field.key}」後面，`}這類欄位通常放密碼或金鑰。`;
+    for (const [a, b] of live) addSecret(ctx, a, b, q.closed ? '中' : '低', reason);
+    return scanEnd;
+  }
+
+  // 陣列裡的每個元素都遮（沒引號的數字和 true/false 這類不遮）
+  function maskArray(ctx, field, from, memo) {
+    const s = ctx.source;
+    const array = readArray(ctx, from, memo);
+    for (const item of array.items) {
+      const text = s.slice(item.start, item.end);
+      if (!item.quoted && (NUMBER.test(text) || NOT_A_SECRET.test(text))) continue;
+      addSecret(ctx, item.start, item.end, array.closed ? '中' : '低', `出現在「${field.key}」後面的陣列裡，這類欄位通常放密碼或金鑰。`);
+    }
+    if (!array.closed) {
+      warn(ctx, from, 'unclosed-array', 'confirm',
+        `「${field.key}」後面的陣列找不到結尾（最多往下看${MAX_VALUE_LINES}行），已經遮了找得到的項目。`, {
+          risk: '陣列後面如果還有項目，會原樣送出。',
+          fix: '確認陣列有沒有完整貼上，補上結尾後重新掃描；確定已經完整的話，可以勾選確認後複製。',
+        });
+    }
+    // 陣列裡有物件時，從第一個物件繼續掃描，物件裡的欄位才會被檢查到
+    if (array.objectAt === -1) return array.scanEnd;
+    noteObject(ctx, memo, field, from, array.closed ? array.scanEnd : -1);
+    return array.objectAt;
+  }
+
+  // YAML 沒引號的值可以延續到下一行（縮排比欄位深）：
+  //   password: abc
+  //     def
+  function maskYamlContinuation(ctx, field, lineNo, scanEnd) {
+    const s = ctx.source;
+    let rows = 0;
+    for (let n = lineNo; n < ctx.lineStarts.length; n++) {
+      const start = ctx.lineStarts[n];
+      const pos = skipBlanks(s, start);
+      const end = lineEndAt(s, pos);
+      if (pos >= end) continue;
+      if (pos - start <= field.keyColumn || s[pos] === '#' || isYamlMapping(s, pos)) break;
+      if (++rows > MAX_VALUE_LINES) {
+        warn(ctx, pos, 'value-too-long', 'confirm', `「${field.key}」的值延續超過${MAX_VALUE_LINES}行，後面的部分沒有遮。`, {
+          risk: '超過的部分會原樣送出。', fix: '把內容分段貼上；或把沒遮到的內容加進自訂文字，遮住之後就不用確認。', ranges: [[pos, pos + 1]],
+        });
+        break;
+      }
+      const b = trimBlankEnd(s, pos, commentAt(s, pos, end));
+      if (b > pos) addSecret(ctx, pos, b, '中', `「${field.key}」的值延續到這一行（YAML的寫法），這一行也遮。`);
+      scanEnd = end;
+    }
+    return scanEnd;
+  }
+
+  // 找到對應的右括號（同一行之內，認得引號）。找不到回傳 -1。
+  function closingParen(s, open) {
+    let depth = 0;
+    let i = open;
+    while (i < s.length && !isBreak(s[i]) && i - open <= SCAN_LIMIT) {
+      const ch = s[i];
+      if (ch === '"' || ch === "'" || ch === '`') {
+        const q = readQuoted(s, i);
+        if (!q || !q.closed || q.lines > 1) return -1;
+        i = q.scanEnd;
+        continue;
+      }
+      if (ch === '(' || ch === '[' || ch === '{') depth++;
+      else if ((ch === ')' || ch === ']' || ch === '}') && --depth === 0) return i + 1;
+      i++;
+    }
+    return -1;
+  }
+
+  // 值後面的預設值：process.env.PW || "…"、os.getenv("PW") or "…"、x ?? "…"
+  function maskFallback(ctx, field, from) {
+    const s = ctx.source;
+    let i = skipBlanks(s, from);
+    if (s.startsWith('||', i) || s.startsWith('??', i)) i += 2;
+    else if (s.startsWith('or', i) && isBlank(s[i + 2])) i += 2;
+    else return from;
+    const q = readQuoted(s, skipBlanks(s, i));
+    if (!q || !q.closed) return from;
+    return maskQuoted(ctx, field, q, false) ?? q.scanEnd;
+  }
+
+  // 讀設定的呼叫裡的預設值：password = os.environ.get("PW", "…")
+  function maskGetterDefaults(ctx, field, from, to) {
+    const s = ctx.source;
+    // 只在呼叫的範圍裡找，不要每次都找到文字結尾
+    GETTER.lastIndex = 0;
+    for (const m of s.slice(from, to).matchAll(GETTER)) {
+      const q = readQuoted(s, skipSpace(ctx, from + m.index + m[0].length));
+      if (q) maskQuoted(ctx, field, q, false);
+    }
+  }
+
+  // 沒引號的值
+  function maskUnquoted(ctx, field, from, mode, memo, nextLine) {
+    const s = ctx.source;
+    let value = readUnquoted(s, from, mode, memo);
+    if (!value) return null;
+    // 整行的值：YAML、.env、INI 這類格式裡，行尾的逗號、分號也是值的一部分，一起遮；
+    // 值看起來是程式寫法（變數、數字、函式呼叫）時，逗號、分號才當成程式的標點保留
+    if (mode === 'line' && value.coreEnd < value.end && isCodeLike(s.slice(value.start, value.coreEnd), field.codeSeparator)) {
+      value = { ...value, end: value.coreEnd };
+    }
+
+    // Authorization: Bearer xxx 只遮 xxx
+    const isAuthorization = isAuthorizationKey(field.key);
+    if (isAuthorization) {
+      const text = s.slice(value.start, value.end);
+      const scheme = /^(?:Bearer|Basic|Token|Bot|Digest|ApiKey)[ \t]+/i.exec(text);
+      if (scheme) {
+        value = { ...value, start: value.start + scheme[0].length };
+      } else if (AUTH_SCHEME.test(text)) {
+        let at = skipBlanks(s, value.end);
+        if (at >= s.length || isBreak(s[at])) { // Bearer 後面換行，值在下一行
+          const next = nextContentLine(ctx, lineOf(ctx.lineStarts, value.start).line);
+          if (!next) return null;
+          at = next.pos;
+        }
+        const next = readUnquoted(s, at, 'inline', null);
+        if (!next) return null;
+        value = next;
+      }
+    }
+    if (value.end <= value.start) return null;
+
+    const text = s.slice(value.start, value.end);
+    let uncertain = false;
+    if (isAuthorization) {
+      if (AUTH_PLACEHOLDER.test(text)) return null; // $TOKEN、{{token}}、<token> 這種只是佔位
+    } else {
+      // YAML 的多行值：遮下面縮排的每一行
+      if (field.atLineStart && !nextLine && YAML_BLOCK.test(text)) {
+        const block = readYamlBlock(ctx, field.keyIndex);
+        for (const row of block.rows) addSecret(ctx, row.start, row.end, '中', `「${field.key}」底下的多行內容，這類欄位通常放密碼或金鑰。`);
+        return block.scanEnd;
+      }
+      if (NOT_A_SECRET.test(text) || PLACEHOLDER.test(text)) return null;
+      // 一行中間的程式寫法：函式呼叫或取值，例如 const token = getToken(user)、await jwt.sign({…})、tokens[0]、
+      // connect(password=get())、{password: getPw() || "…"}。呼叫本身不遮，括號裡的欄位照常檢查；
+      // 呼叫裡讀設定的預設值和後面的 || "…" 要遮
+      if (mode === 'inline' && !field.atLineStart) {
+        CODE_CALL.lastIndex = value.start;
+        const call = CODE_CALL.exec(s);
+        if (call) {
+          const close = closingParen(s, value.start + call[0].length - 1);
+          if (close === -1) return null;
+          maskGetterDefaults(ctx, field, value.start, close);
+          const after = maskFallback(ctx, field, close);
+          return after > close ? after : null;
+        }
+        if (CODE_KEYWORD.test(text)) return null; // await、new 後面接的不是呼叫，也是程式
+      }
+      if (field.atLineStart && field.codeSeparator && CODE_EXPRESSION.test(text)) { // password = getpass()
+        maskGetterDefaults(ctx, field, value.start, value.end);
+        return null;
+      }
+      // {"token": token} 這種有引號的名稱後面接沒引號的單字，多半是程式的變數
+      uncertain = looksLikeReference(text, field.codeSeparator || (mode === 'inline' && !!field.keyQuote));
+    }
+
+    if (mergeIntoKnownKey(ctx, value.start, value.end, field.key)) return value.scanEnd;
+    const lead = nextLine ? `「${field.key}」的值寫在下一行。` : `出現在「${field.key}」後面。`;
+    let reason = uncertain ? `${lead}值看起來像程式的變數或參照，也可能是真的密碼，請確認。` : `${lead}這類欄位通常放密碼或金鑰。`;
+    if (text[0] === '#') reason = `${lead}「#」後面可能是註解；如果這其實是密碼，已經先遮住，確定是註解可以改成保留。`;
+    addSecret(ctx, value.start, value.end, uncertain || text[0] === '#' ? '低' : '中', reason);
+    let scanEnd = value.scanEnd;
+    if (mode === 'inline') scanEnd = maskFallback(ctx, field, scanEnd);
+    if (mode === 'line' && field.yamlValue && !nextLine) scanEnd = maskYamlContinuation(ctx, field, field.lineNo, scanEnd);
+    // 行首的大寫環境變數照命令列的規則遮到空白為止。後面還有文字時，可能是要執行的命令（DB_PASSWORD=abc npm start），
+    // 也可能是 .env 裡沒加引號、本來就有空白的值，看不出來，要使用者確認
+    if (mode === 'shell' && field.atLineStart && UPPER_ENV.test(field.key)) {
+      const rest = skipBlanks(s, value.scanEnd);
+      const lineEnd = lineEndAt(s, rest);
+      if (rest < lineEnd && !/^(?:&&|\|\||[|;&<>#]|[A-Za-z_]\w*=)/.test(s.slice(rest, rest + 64))) {
+        warn(ctx, rest, 'shell-rest', 'confirm',
+          `「${field.key}」的值照命令列的規則遮到空白為止，後面的「${shorten(s.slice(rest, lineEnd), 24)}」沒有遮。`, {
+            risk: '如果這是設定檔、值本來就有空白，空白後面那段會原樣送出。',
+            fix: '那段也是值的話，把它加進自訂文字，遮住之後就不用確認；確定是要執行的命令，可以勾選確認後複製。',
+            ranges: [[rest, rest + 1]],
+          });
+      }
+    }
+    return scanEnd;
+  }
+
+  // YAML 的值是寫在下一行的清單：
+  //   password:
+  //     - abc
+  // 遇到「- user: x」這種物件項目就停下來，交給一般掃描
+  function maskYamlSequence(ctx, field, next, memo) {
+    const s = ctx.source;
+    const dashIndent = next.indent;
+    let scanEnd = next.pos;
+    let lines = 0;
+    for (let n = next.line - 1; n < ctx.lineStarts.length; n++) {
+      const start = ctx.lineStarts[n];
+      const pos = skipBlanks(s, start);
+      const end = lineEndAt(s, pos);
+      if (pos >= end) continue;
+      const indent = pos - start;
+      if (indent < dashIndent) break;
+      if (++lines > MAX_VALUE_LINES) {
+        warn(ctx, pos, 'value-too-long', 'confirm', `「${field.key}」底下的清單超過${MAX_VALUE_LINES}行，後面的項目沒有遮。`, {
+          risk: '超過的項目會原樣送出。', fix: '把清單分段貼上；或把沒遮到的項目加進自訂文字，遮住之後就不用確認。', ranges: [[pos, pos + 1]],
+        });
+        break;
+      }
+      if (indent === dashIndent && !isDashItem(s, pos)) break;
+      let item = pos;
+      while (isDashItem(s, item)) item = skipBlanks(s, item + 1); // 「- 」可以有好幾層：- - abc
+      if (item >= end) {
+        scanEnd = end;
+        continue;
+      }
+      const q = readQuoted(s, item);
+      if (q) {
+        if (q.closed && isKeyAfter(s, q.scanEnd)) { // "user": x 這種物件項目
+          noteObject(ctx, memo, field, start, -1, true);
+          return Math.max(start, scanEnd);
+        }
+        scanEnd = Math.max(scanEnd, maskQuoted(ctx, field, q, true) ?? q.scanEnd);
+        continue;
+      }
+      // 物件項目：交給一般掃描
+      if ((s[item] === '{' && braceIsObject(s, item)) || isYamlMapping(s, item)) {
+        noteObject(ctx, memo, field, start, -1, true);
+        return Math.max(start, scanEnd);
+      }
+      if (s[item] === '[') {
+        scanEnd = Math.max(scanEnd, maskArray(ctx, field, item, memo));
+        continue;
+      }
+      const b = trimBlankEnd(s, item, commentAt(s, item, end));
+      const text = s.slice(item, b);
+      if (b > item && !NUMBER.test(text) && !NOT_A_SECRET.test(text)) {
+        addSecret(ctx, item, b, '中', `「${field.key}」底下的清單項目，這類欄位通常放密碼或金鑰。`);
+      }
+      scanEnd = end;
+    }
+    return scanEnd;
+  }
+
+  // YAML 的值寫在下一行（比欄位縮排深）：清單、多行的純文字。下一行是另一個欄位代表是巢狀物件，交給一般掃描。
+  function maskYamlNested(ctx, field, next, memo) {
+    const s = ctx.source;
+    if (isDashItem(s, next.pos)) return maskYamlSequence(ctx, field, next, memo);
+    if (isYamlMapping(s, next.pos)) {
+      noteObject(ctx, memo, field, ctx.lineStarts[next.line - 1], -1);
+      return null;
+    }
+    const rows = [];
+    let scanEnd = next.pos;
+    for (let n = next.line - 1; n < ctx.lineStarts.length; n++) {
+      const start = ctx.lineStarts[n];
+      const pos = skipBlanks(s, start);
+      const end = lineEndAt(s, pos);
+      if (pos >= end) continue;
+      if (pos - start <= field.keyColumn) break;
+      // 縮排比第一行淺的「名稱: 值」：多半是排版沒對齊的下一個欄位，不算在值裡
+      if (rows.length && pos - start < next.indent && isYamlMapping(s, pos)) break;
+      if (rows.length >= MAX_VALUE_LINES) {
+        warn(ctx, pos, 'value-too-long', 'confirm', `「${field.key}」底下的內容超過${MAX_VALUE_LINES}行，後面的部分沒有遮。`, {
+          risk: '超過的部分會原樣送出。', fix: '把內容分段貼上；或把沒遮到的內容加進自訂文字，遮住之後就不用確認。', ranges: [[pos, pos + 1]],
+        });
+        break;
+      }
+      rows.push([pos, trimBlankEnd(s, pos, commentAt(s, pos, end))]);
+      scanEnd = end;
+    }
+    if (rows.length === 1) return maskUnquoted(ctx, field, rows[0][0], 'line', memo, true);
+    for (const [a, b] of rows) {
+      if (b > a) addSecret(ctx, a, b, '中', `「${field.key}」下一行開始的多行內容，每一行分開遮。`);
+    }
+    return rows.length ? scanEnd : null;
+  }
+
+  // 欄位這一行沒有值：往下找第一個有內容的行（跳過空行和 # 或 // 開頭的註解行）
+  function nextContentLine(ctx, lineNo) {
+    const s = ctx.source;
+    const last = Math.min(ctx.lineStarts.length, lineNo + MAX_VALUE_LINES);
+    for (let n = lineNo; n < last; n++) {
+      const start = ctx.lineStarts[n];
+      const pos = skipBlanks(s, start);
+      if (pos >= s.length) return null;
+      if (isBreak(s[pos]) || isCommentAt(s, pos)) continue;
+      return { line: n + 1, pos, indent: pos - start };
+    }
+    return null;
+  }
+
+  // 欄位這一行沒有值，往下隔了超過 MAX_VALUE_LINES 行的空行、註解還沒找到內容：
+  // 之後那一行如果比欄位深（或是 { [ 引號開頭），可能就是這個欄位的值或物件，工具沒有檢查，要使用者確認
+  function warnFarValue(ctx, field) {
+    const s = ctx.source;
+    const total = ctx.lineStarts.length;
+    if (field.lineNo + MAX_VALUE_LINES >= total) return; // 沒到上限，就是真的沒有值
+    for (let n = field.lineNo + MAX_VALUE_LINES; n < total; n++) {
+      const start = ctx.lineStarts[n];
+      const pos = skipBlanks(s, start);
+      if (pos >= s.length) return;
+      if (isBreak(s[pos]) || isCommentAt(s, pos)) continue;
+      if (pos - start <= field.keyColumn && !'{["\''.includes(s[pos])) return;
+      warn(ctx, field.keyIndex, 'value-too-far', 'confirm',
+        `「${field.key}」後面隔了超過${MAX_VALUE_LINES}行的空行或註解，工具沒有再往下找它的值（第${field.lineNo}行）。`, {
+          risk: `第${n + 1}行開始的內容如果是這個欄位的值或物件，會原樣送出。`,
+          fix: '把中間的空行和註解刪短一點，再重新掃描；確定沒問題，可以勾選確認後複製。',
+          ranges: [],
+        });
+      return;
+    }
+  }
+
+  // 值寫在下一行：JSON、JavaScript 物件、YAML、Python 的參數都可以這樣排
+  //   {"password":
+  //    "abc"}
+  // continued：這一行結尾是「\」（明確寫了接到下一行）
+  function maskNextLineValue(ctx, field, memo, continued = false) {
+    const next = nextContentLine(ctx, field.lineNo);
+    if (!next) {
+      warnFarValue(ctx, field);
+      return null;
+    }
+    const s = ctx.source;
+    const { pos } = next;
+    const q = readQuoted(s, pos);
+    // KEY= 後面沒有值：命令列和 .env 的空值，下一行是別的指令。只有下一行單獨一個字串（Python 的參數換行）才算值
+    if (field.tight && !continued) return endsLikeContinuation(s, q) ? maskQuoted(ctx, field, q, true) : null;
+    if (field.yaml && !continued && next.indent <= field.keyColumn && !(next.indent === field.keyColumn && isDashItem(s, pos))) {
+      return null; // YAML：下一行沒有比欄位深，代表這個欄位是空的
+    }
+    if (s[pos] === '{' && braceIsObject(s, pos)) { // 物件：裡面的欄位會另外檢查
+      noteObject(ctx, memo, field, pos);
+      return null;
+    }
+    if (s[pos] === '[') return maskArray(ctx, field, pos, memo);
+    if (q) {
+      if (q.closed && isKeyAfter(s, q.scanEnd)) return null; // 下一行是另一個欄位："user": …
+      return maskQuoted(ctx, field, q, true);
+    }
+    if (continued) return maskUnquoted(ctx, field, pos, 'line', memo, true);
+    if (field.yaml || (field.yamlValue && next.indent > field.keyColumn)) return maskYamlNested(ctx, field, next, memo);
+    // 其他沒引號的內容：只有「"password":」這種有引號的欄位（JSON、Python、PHP）才接著讀，例如 JSON 的數字。
+    // 一般文字裡的「password:」後面換行，多半是下一句話，不當成值。
+    if (!field.keyQuote || field.separator === '=' || field.separator === ':=' || isKeyAt(s, pos)) return null;
+    return maskUnquoted(ctx, field, pos, 'line', memo, true);
+  }
+
+  // 值是括號：password = ("abc" "def")，或「(」後面換行再寫字串（Python 拆長字串的寫法）。
+  // 回傳括號裡第一個字串；「(」單獨在行尾、下一行又不是字串時回傳 'none'（多半是程式，不遮）；其他情況回傳 null
+  function stringInParens(ctx, field, from) {
+    const s = ctx.source;
+    let i = skipBlanks(s, from + 1);
+    if (i >= s.length || isBreak(s[i])) {
+      const next = nextContentLine(ctx, field.lineNo);
+      if (!next) return 'none';
+      const q = readQuoted(s, next.pos);
+      return q || 'none';
+    }
+    return readQuoted(s, i);
+  }
+
+  // 欄位名稱在字串裡：
+  //   "Enter password:"、{"msg": "token=", …}：字串在分隔符號後面就結束，值是緊接著的下一個字串（如果有）
+  //   log("password=%s", "…")：值是格式化的佔位，對應的參數如果是字串就遮
+  //   "SELECT … WHERE password = 'abc'"：字串裡用另一種引號包起來的值
+  //   "DB_PASSWORD=abc,def"：整個字串就是「名稱=值」，值到字串結尾
+  //   其他情況照一行中間的值處理
+  function maskInString(ctx, field, from, quote, open, memo) {
+    const s = ctx.source;
+    const v = skipBlanks(s, from);
+    // 同一個字串裡有好幾個欄位時，結尾引號只找一次
+    if (memo.closeOpen !== open) {
+      memo.closeOpen = open;
+      memo.closeAt = closingQuote(s, open + 1, quote);
+    }
+    const end = memo.closeAt === -1 || memo.closeAt >= v ? memo.closeAt : closingQuote(s, v, quote);
+    // 1. 字串在這裡就結束了：值在字串外面，照一般的規則接字串
+    if (v === end) {
+      let i = skipBlanks(s, end + 1);
+      if (s[i] === ',' || s[i] === '+') i = skipBlanks(s, i + 1);
+      const q = readQuoted(s, i);
+      if (!q || !q.closed || isKeyAfter(s, q.scanEnd)) return null;
+      return maskQuoted(ctx, { ...field, inString: false }, q, false);
+    }
+    // 2. 格式化的佔位：數這是字串裡第幾個佔位（同一個字串接著上次的位置數），遮對應的參數。
+    //    回傳佔位的結尾，同一個字串裡後面的欄位（"user=%s password=%s token=%s"）才會繼續檢查
+    FORMAT_SLOT_AT.lastIndex = v;
+    if (end !== -1 && FORMAT_SLOT_AT.test(s)) {
+      const slotEnd = FORMAT_SLOT_AT.lastIndex;
+      if (memo.slotOpen !== open || memo.slotPos > v) {
+        memo.slotOpen = open;
+        memo.slotPos = open + 1;
+        memo.slotCount = 0;
+      }
+      memo.slotCount += (s.slice(memo.slotPos, v).match(FORMAT_SLOT) || []).length;
+      memo.slotPos = v;
+      maskFormatArgument(ctx, { ...field, inString: false }, end + 1, memo.slotCount, memo);
+      return slotEnd;
+    }
+    // 3. 字串裡用另一種引號包起來的值
+    if ((s[v] === '"' || s[v] === "'" || s[v] === '`') && s[v] !== quote) {
+      const q = readQuoted(s, v);
+      if (q.closed && q.lines === 1 && (end === -1 || q.scanEnd <= end)) return maskQuoted(ctx, field, q, false);
+    }
+    // 4. "KEY=value"：整個字串就是一個設定。表單格式的 'password=abc&user=a' 到下一個「&名稱=」為止
+    if (field.tight && open + 1 === field.keyIndex && end !== -1) {
+      let stop = v;
+      while (stop < end && !(s[stop] === '&' && /^[A-Za-z_][\w.-]*=/.test(s.slice(stop + 1, stop + 66)))) stop++;
+      if (stop > v) addSecret(ctx, v, stop, '中', `出現在「${field.key}」後面，這類欄位通常放密碼或金鑰。`);
+      return stop;
+    }
+    return maskUnquoted(ctx, field, v, 'inline', memo, false);
+  }
+
+  // 同一行裡，字串的結尾引號在哪裡（認得 \" 跳脫）。找不到回傳 -1。
+  function closingQuote(s, from, quote) {
+    for (let i = from; i < s.length && !isBreak(s[i]); i++) {
+      if (s[i] === '\\') i++;
+      else if (s[i] === quote) return i;
+    }
+    return -1;
+  }
+
+  // 格式化字串後面的參數：log("password=%s", "…")、"password=%s" % ("…",)、"password={}".format("…")。
+  // index 是第幾個佔位，對應的參數如果是字串就遮。
+  // 每個參數從哪裡開始記在 memo.args：同一個格式化字串有好幾個欄位時，參數只找一次。
+  function maskFormatArgument(ctx, field, from, index, memo) {
+    const s = ctx.source;
+    if (memo.argsFrom !== from) {
+      memo.argsFrom = from;
+      memo.args = [];
+      memo.argsDone = false;
+      // 參數可以分好幾行寫：log("password=%s",換行"…")、"password=%s" %換行("…",)
+      let i = skipSpace(ctx, from);
+      if (s[i] === ',' || s[i] === '%') i++;
+      else if (s.startsWith('.format', i)) i += 7;
+      else memo.argsDone = true;
+      i = skipSpace(ctx, i);
+      if (s[i] === '(') i = skipSpace(ctx, i + 1);
+      if (!memo.argsDone) memo.args.push(i);
+    }
+    while (memo.args.length <= index && !memo.argsDone) {
+      const next = nextArgument(ctx, memo.args[memo.args.length - 1]);
+      if (next === -1) memo.argsDone = true;
+      else memo.args.push(next);
+    }
+    if (index >= memo.args.length) return null;
+    const q = readQuoted(s, memo.args[index]);
+    return q ? maskQuoted(ctx, field, q, false) : null;
+  }
+
+  // 跳過一個參數：到同一層的逗號為止，回傳下一個參數的開頭；後面沒有參數回傳 -1。
+  // 參數可以跨行（最多 MAX_VALUE_LINES 行），中間的 # 或 // 註解跳過
+  function nextArgument(ctx, i) {
+    const s = ctx.source;
+    const limit = windowEnd(ctx, i);
+    let depth = 0;
+    while (i < limit) {
+      const ch = s[i];
+      if (ch === '"' || ch === "'" || ch === '`') {
+        const skip = readQuoted(s, i);
+        if (!skip.closed) return -1;
+        i = skip.scanEnd;
+        continue;
+      }
+      if (isCommentAt(s, i)) {
+        i = lineEndAt(s, i);
+        continue;
+      }
+      if ('([{'.includes(ch)) depth++;
+      else if (')]}'.includes(ch) && --depth < 0) return -1;
+      else if (ch === ',' && depth === 0) return skipSpace(ctx, i + 1);
+      i++;
+    }
+    return -1;
+  }
+
+  // 跳過空白、換行和註解，回傳下一個有內容的位置（呼叫的參數可以分好幾行寫）；最多往下看 MAX_VALUE_LINES 行
+  function skipSpace(ctx, i) {
+    const s = ctx.source;
+    i = skipBlanks(s, i);
+    if (i < s.length && !isBreak(s[i]) && !isCommentAt(s, i)) return i;
+    const next = nextContentLine(ctx, lineOf(ctx.lineStarts, Math.min(i, s.length)).line);
+    return next ? next.pos : s.length;
+  }
+
+  // 一般掃描漏掉的兩種寫法：Go 的 var password string = "…"，以及 os.getenv("DB_PASSWORD", "…")、
+  // setProperty("password", "…") 這種名稱和值都當成參數的呼叫
+  function detectOtherDeclarations(ctx) {
+    const s = ctx.source;
+    for (const m of s.matchAll(GO_DECLARATION)) {
+      if (!isSecretKey(m[1])) continue;
+      const q = readQuoted(s, skipSpace(ctx, m.index + m[0].length));
+      if (q) maskQuoted(ctx, { key: m[1] }, q, false);
+    }
+    GETTER.lastIndex = 0;
+    for (const m of s.matchAll(GETTER)) {
+      if (!isSecretKey(m[2])) continue;
+      // 值可以寫在下一行；字串沒貼完整時，也照常遮第一行並列為要確認
+      const q = readQuoted(s, skipSpace(ctx, m.index + m[0].length));
+      if (q) maskQuoted(ctx, { key: m[2] }, q, false);
+    }
+  }
+
+  /* ---------- 敏感欄位底下的物件（決策D04） ---------- */
+  // secrets:、credentials:、"tokens": [{…}] 這種敏感名稱底下是物件時，裡面的欄位還是照各自的名稱遮
+  // （password 會遮，user、db 不會），保留除錯線索。但這些沒遮的值用途看不出來，所以列為要確認（F13），
+  // 讓使用者檢查；需要遮的值加進自訂文字，全部遮住之後就不用確認。
+
+  // 記下物件的範圍。end 是 -1 時看縮排：從欄位那一行往下，縮排比欄位深的行都算（dash：同一層的「- 」也算）
+  function noteObject(ctx, memo, field, start, end, dash = false) {
+    // 沒給結尾、從「{」開始的：找對應的「}」
+    let stop = end === undefined ? (ctx.source[start] === '{' ? skipObject(ctx, start, memo) : -1) : end;
+    let cut = false;
+    if (stop <= start && end === undefined && ctx.source[start] === '{') {
+      // 明確用大括號寫的物件：只看括號配對，不看縮排（{"secrets":{ 換行後沒有縮排也算在物件裡）。
+      // 在行數上限內找不到結尾，就把看得到的部分當成物件，並列為沒檢查完、一定要確認
+      stop = skipObject(ctx, start, memo, true);
+      if (stop <= start) {
+        stop = windowEnd(ctx, start);
+        cut = true;
+      }
+    }
+    if (stop <= start) {
+      const indent = field.yaml || field.yamlValue ? field.keyColumn : indentOf(ctx, field.keyIndex);
+      ({ end: stop, cut } = blockEnd(ctx, field.lineNo, indent, dash));
+    }
+    if (stop > start) memo.secretObjects.push({ key: field.key, keyIndex: field.keyIndex, start, end: stop, cut });
+  }
+
+  // 從第 lineNo 行的下一行開始，縮排比 indent 深的連續幾行（空行跳過）到哪裡結束；一行都沒有時 end 是 -1。
+  // 最多看 MAX_VALUE_LINES 行；看到上限時物件還沒結束，cut 是 true（後面的部分沒有檢查）
+  function blockEnd(ctx, lineNo, indent, dash) {
+    const s = ctx.source;
+    const inside = (n) => {
+      const start = ctx.lineStarts[n];
+      const pos = skipBlanks(s, start);
+      const lineEnd = lineEndAt(s, pos);
+      if (pos >= lineEnd) return 0; // 空行
+      const depth = pos - start;
+      return depth > indent || (depth === indent && dash && isDashItem(s, pos)) ? lineEnd : -1;
+    };
+    let end = -1;
+    const last = Math.min(ctx.lineStarts.length, lineNo + MAX_VALUE_LINES);
+    for (let n = lineNo; n < last; n++) {
+      const lineEnd = inside(n);
+      if (lineEnd < 0) return { end, cut: false };
+      if (lineEnd) end = lineEnd;
+    }
+    // 到了上限：往下找第一個有內容的行，還在物件裡就代表後面沒檢查到
+    for (let n = last; n < ctx.lineStarts.length; n++) {
+      const lineEnd = inside(n);
+      if (lineEnd) return { end, cut: lineEnd > 0 };
+    }
+    return { end, cut: false };
+  }
+
+  // 物件裡的值：有名稱的欄位的值、陣列和清單的項目。回傳 [{ start, end, key }]，key 是值前面的欄位名稱（清單項目是空字串）
+  const OPERATOR_ONLY = /^[\s+\-*\/=<>!&|?:.,;~^%()[\]{}]*$/;
+  const LEAF_KEY = /(?:(\\{0,7}["'])[ \t]{0,3}([A-Za-z_][\w.-]{0,63})[ \t]{0,3}\1|([A-Za-z_][\w.-]{0,63}))[ \t]*(?::(?![:=])|=(?![=>])|=>)[ \t]*/y;
+  function objectLeaves(ctx, from, to) {
+    const s = ctx.source;
+    const leaves = [];
+    // quoted：值是引號裡的字串。字串不管內容像什麼（中文、符號、"false"、"demo()"）都算值；
+    // 沒引號的才排除程式的寫法：只有運算子（+、=>）、true／null 這類關鍵字、函式呼叫、YAML 多行值的標記
+    const push = (a, b, key, quoted) => {
+      if (key && isAuthorizationKey(key)) { // Authorization 的 Bearer 不算值
+        const scheme = /^(?:Bearer|Basic|Token|Bot|Digest|ApiKey)(?:[ \t]+|$)/i.exec(s.slice(a, b));
+        if (scheme) a += scheme[0].length;
+      }
+      const text = s.slice(a, b);
+      if (b <= a || !text.trim()) return;
+      if (!quoted && (OPERATOR_ONLY.test(text) || NOT_A_SECRET.test(text) || PLACEHOLDER.test(text)
+        || CODE_EXPRESSION.test(text) || YAML_BLOCK.test(text))) return;
+      leaves.push({ start: a, end: b, key });
+    };
+    let i = from;
+    while (i < to) {
+      const ch = s[i];
+      if (isBlank(ch) || isBreak(ch) || ',{}[]()'.includes(ch)) {
+        i++;
+        continue;
+      }
+      if (isCommentAt(s, i) && (i === from || /[\s,{[]/.test(s[i - 1]))) {
+        i = lineEndAt(s, i);
+        continue;
+      }
+      if (isDashItem(s, i)) {
+        i = skipBlanks(s, i + 1);
+        LEAF_KEY.lastIndex = i;
+        if (!LEAF_KEY.test(s) && i < to && !isBreak(s[i]) && !quotedAt(s, i) && s[i] !== '{' && s[i] !== '[') {
+          const lineEnd = Math.min(lineEndAt(s, i), to);
+          const b = trimBlankEnd(s, i, commentAt(s, i, lineEnd));
+          push(i, b, '', false);
+          i = lineEnd;
+        }
+        continue;
+      }
+      LEAF_KEY.lastIndex = i;
+      const m = LEAF_KEY.exec(s);
+      if (m && (i === from || !isWordChar(s[i - 1]))) {
+        const key = m[2] || m[3];
+        const lineStart = ctx.lineStarts[lineOf(ctx.lineStarts, i).line - 1];
+        const atLineStart = /^[ \t]*(?:-[ \t]+)?$/.test(s.slice(lineStart, i));
+        const keyStart = s.indexOf(key, i);
+        i += m[0].length;
+        const q = quotedAt(s, i);
+        if (q) {
+          for (const [a, b] of q.parts) push(a, b, key, true);
+          i = Math.max(q.scanEnd, i + 1);
+          continue;
+        }
+        if (i >= to || isBreak(s[i]) || isCommentAt(s, i)) {
+          // 「名稱:」後面沒有值、底下也沒有更深的內容：這個名稱本身可能就是值（password: 換行 abc: ）
+          const next = nextContentLine(ctx, lineOf(ctx.lineStarts, Math.min(i, s.length)).line);
+          if (atLineStart && (!next || next.pos >= to || next.indent <= skipBlanks(s, lineStart) - lineStart)) {
+            push(keyStart, keyStart + key.length, key, false);
+          }
+          continue;
+        }
+        if ('{['.includes(s[i])) continue;
+        if (atLineStart) { // YAML 或一行一個欄位的寫法：到行尾或註解
+          const lineEnd = Math.min(lineEndAt(s, i), to);
+          const end = trimBlankEnd(s, i, commentAt(s, i, lineEnd));
+          push(i, trimCodeEnd(s, i, end), key, false);
+          i = lineEnd;
+        } else {
+          INLINE_VALUE.lastIndex = i;
+          const v = INLINE_VALUE.exec(s);
+          const b = v ? Math.min(i + v[0].length, to) : i + 1;
+          if (v) push(i, b, key, false);
+          i = b;
+        }
+        continue;
+      }
+      const q = quotedAt(s, i);
+      if (q) {
+        if (!(q.closed && isKeyAfter(s, q.scanEnd))) for (const [a, b] of q.parts) push(a, b, '', true);
+        i = Math.max(q.scanEnd, i + 1);
+        continue;
+      }
+      // 沒有名稱的項目（陣列裡沒引號的值），或其他程式寫法
+      INLINE_VALUE.lastIndex = i;
+      const v = INLINE_VALUE.exec(s);
+      const b = v ? Math.min(i + v[0].length, to) : i + 1;
+      if (v) push(i, b, '', false);
+      i = b;
+    }
+    return leaves;
+  }
+
+  function warnSecretObjects(ctx, objects) {
+    let coveredTo = -1;
+    for (const obj of objects.sort((a, b) => a.start - b.start)) {
+      if (obj.start < coveredTo) continue; // 包在別的敏感物件裡的，跟外面那一個一起提醒
+      coveredTo = obj.end;
+      const leaves = objectLeaves(ctx, obj.start, obj.end);
+      if (!leaves.length && !obj.cut) continue;
+      const names = [...new Set(leaves.map((leaf) => leaf.key).filter((key) => key && !isSecretKey(key)))].slice(0, 3);
+      const first = lineOf(ctx.lineStarts, obj.start).line;
+      const last = lineOf(ctx.lineStarts, Math.max(obj.start, obj.end - 1)).line;
+      const where = `第${first === last ? first : first + '～' + last}行`;
+      if (obj.cut) {
+        // 超過行數上限：後面的部分沒有檢查，不能用前面都遮到了就當成整個物件都處理好（ranges 留空＝一定要確認）
+        warn(ctx, obj.keyIndex, 'secret-object', 'confirm',
+          `「${obj.key}」底下的物件超過${MAX_VALUE_LINES}行或找不到結尾，工具只檢查了前面的部分（${where}），後面的值可能還有敏感資訊。`, {
+            risk: '物件後面沒檢查到的部分、以及前面沒被遮的值，都會原樣送出。',
+            fix: '把這個物件分段貼上，或補上缺的結尾括號，再重新掃描；確定沒問題，可以勾選確認後複製。',
+            ranges: [],
+          });
+        continue;
+      }
+      warn(ctx, obj.keyIndex, 'secret-object', 'confirm',
+        `「${obj.key}」底下的物件只依子欄位的名稱偵測，其他值可能還有敏感資訊（${where}）。`, {
+          risk: names.length
+            ? `像「${names.join('」「')}」這些不是敏感名稱的欄位，值不會自動遮，會原樣送出。`
+            : '物件裡沒有被遮的值會原樣送出。',
+          fix: '請檢查這段內容，需要遮罩的值可以加進自訂文字，遮住之後就不用確認；確定沒問題，可以勾選確認後複製。',
+          ranges: leaves.map((leaf) => [leaf.start, leaf.end]),
+        });
+    }
+  }
+
+  function detectSecretFields(ctx) {
+    const s = ctx.source;
+    const memo = { runStart: -1, runEnd: -1, objects: new Map(), strictObjects: new Map(), headLine: -1, heads: [], secretObjects: [] };
+    restartQuotes(memo, -1, 0);
+    FIELD.lastIndex = 0;
+    let m;
+    while ((m = FIELD.exec(s)) !== null) {
+      const [whole, keyQuote = '', quotedKey, plainKey, bracket, spaceBefore, matched, spaceAfter] = m;
+      const key = quotedKey || plainKey;
+      let from = m.index + whole.length;
+      // 前後有空白的 =~ 是比對運算子，不是設定值
+      if (matched === '=' && s[from - spaceAfter.length] === '~' && spaceBefore) continue;
+      // config["password"] = …、config[ "password" ] = …：右中括號前面要是對應的左中括號
+      if (bracket) {
+        let open = m.index - 1;
+        while (open >= 0 && isBlank(s[open])) open--;
+        if (s[open] !== '[') continue;
+      }
+      if (!isSecretKey(key)) continue;
+
+      const lineNo = lineOf(ctx.lineStarts, m.index).line;
+      const lineStart = ctx.lineStarts[lineNo - 1];
+      const atLineStart = lineHeads(ctx, lineStart, memo).includes(m.index);
+      let separator = matched;
+      if ((separator === '==' || separator === '===' || separator === '=>') && !keyQuote && !spaceBefore && !spaceAfter
+        && (atLineStart || (UPPER_ENV.test(key) && isShellWord(s, m.index, lineStart)
+          && !/(?:^|[^\w$])(?:async|await|return|yield)[ \t]+$/.test(s.slice(Math.max(lineStart, m.index - 16), m.index))))) {
+        // KEY==value、KEY=>value 在行首或命令裡：設定的寫法，值本身以 = 或 > 開頭（隨機產生的密碼常有這些符號）
+        separator = '=';
+        from = m.index + key.length + 1;
+      } else if (separator === '=>' && !keyQuote && s[m.index - 1] !== ':') {
+        continue; // 沒引號的 => 是 JavaScript 箭頭函式；Ruby 的 :password => 才是設定值
+      }
+      let field = {
+        key,
+        keyQuote,
+        separator,
+        lineNo,
+        keyIndex: m.index,
+        keyColumn: m.index - lineStart,
+        atLineStart,
+        tight: separator === '=' && !spaceBefore && !spaceAfter,
+        codeSeparator: (separator === '=' || separator === ':=') && spaceBefore.length > 0,
+        yaml: separator === ':' && atLineStart && !keyQuote, // 沒引號的「名稱:」在行首，當成 YAML
+        // 行首的「名稱:」不管有沒有引號，沒引號的值都可以照 YAML 的規則延續到下一行（"password": abc 換行 def）
+        yamlValue: separator === ':' && atLineStart,
+        compare: separator === '==' || separator === '===' || separator[0] === '!',
+      };
+      // KEY=value 是命令列或設定檔的寫法：在行首，或在命令裡（前面是空白或 - --，不是接在逗號、括號後面）
+      field.shell = field.tight && (atLineStart || isShellWord(s, m.index, lineStart));
+
+      // 型別標註：password: str = "…"，值在等號後面
+      if (separator === ':' && !keyQuote) {
+        TYPE_ANNOTATION.lastIndex = from;
+        if (TYPE_ANNOTATION.test(s)) {
+          from = TYPE_ANNOTATION.lastIndex;
+          field = { ...field, separator: '=', codeSeparator: true, yaml: false, yamlValue: false };
+        }
+      }
+
+      let scanEnd;
+      let paren;
+      const first = skipBlanks(s, from);
+      const inString = keyQuote ? null : enclosingQuote(ctx, m.index, lineStart, memo);
+      if (inString) field.inString = true;
+      if (field.compare) {
+        // if password == "1234"：只看緊接著的引號字串。typeof token === "string" 這種型別檢查不算
+        const q = readQuoted(s, first);
+        const typeCheck = /typeof[ \t]+$/.test(s.slice(Math.max(lineStart, m.index - 12), m.index))
+          || (q && q.parts.length === 1 && NOT_A_SECRET.test(s.slice(q.parts[0][0], q.parts[0][1])));
+        scanEnd = q && q.closed && q.lines === 1 && !typeCheck ? maskQuoted(ctx, field, q, false) : null;
+      } else if (inString) {
+        scanEnd = maskInString(ctx, field, from, inString.quote, inString.open, memo);
+      } else if (first >= s.length || isBreak(s[first])) {
+        scanEnd = maskNextLineValue(ctx, field, memo);
+      } else if (s[from] === '\\' && (first + 1 >= s.length || isBreak(s[skipBlanks(s, from + 1)]))) {
+        scanEnd = maskNextLineValue(ctx, field, memo, true); // password = \ 接到下一行
+      } else if (s[from] === '\\') {
+        const q = readEscapedQuoted(s, from); // 字串裡的 JSON
+        scanEnd = q ? maskQuoted(ctx, field, q, false) : maskUnquoted(ctx, field, from, 'inline', memo, false);
+      } else if (isCommentAt(s, from) && spaceAfter) {
+        // 「password: # …」：# 後面是註解，值可能寫在下一行；下一行沒有值時，保險起見把這段遮住
+        scanEnd = maskNextLineValue(ctx, field, memo);
+        if (scanEnd === null) scanEnd = maskUnquoted(ctx, field, from, field.atLineStart || field.shell ? 'line' : 'inline', memo, false);
+      } else if (!field.shell && s[from] === '{' && braceIsObject(s, from)) {
+        noteObject(ctx, memo, field, from); // 物件：裡面的欄位會另外掃描
+        scanEnd = null;
+      } else if (!field.shell && s[from] === '[') {
+        scanEnd = maskArray(ctx, field, from, memo);
+      } else if (!field.shell && s[from] === '(' && (paren = stringInParens(ctx, field, from))) {
+        scanEnd = paren === 'none' ? null : maskQuoted(ctx, field, paren, false, true);
+      } else {
+        const q = readQuoted(s, from);
+        let mode = 'inline';
+        if (field.shell) mode = UPPER_ENV.test(key) || !atLineStart ? 'shell' : 'line';
+        else if (atLineStart) mode = 'line';
+        scanEnd = q ? maskQuoted(ctx, field, q, false) : maskUnquoted(ctx, field, from, mode, memo, false);
+      }
+      // 確定是值的地方不再找欄位，也避免同一段被重複掃描
+      if (scanEnd !== null && scanEnd !== undefined && scanEnd > FIELD.lastIndex) {
+        FIELD.lastIndex = scanEnd;
+        // 值跨到後面的行（三引號、值寫在下一行）：那一行的引號從值的結尾開始算，值裡面的引號不算
+        const endLine = lineOf(ctx.lineStarts, scanEnd).line;
+        if (endLine > lineNo) restartQuotes(memo, ctx.lineStarts[endLine - 1], scanEnd);
+      }
+    }
+    warnSecretObjects(ctx, memo.secretObjects);
+    detectOtherDeclarations(ctx);
+  }
+
+  // KEY=value 在一行中間時，是不是命令列的一個參數：前面是空白（或 - --），而且不是接在逗號、括號、? & 後面
+  function isShellWord(s, keyIndex, lineStart) {
+    let k = keyIndex;
+    while (k > lineStart && keyIndex - k < 2 && s[k - 1] === '-') k--;
+    if (k === lineStart) return true;
+    if (!isBlank(s[k - 1])) return false;
+    let j = k - 1;
+    while (j > lineStart && isBlank(s[j - 1])) j--;
+    return j === lineStart || !'(,[{&?;=:'.includes(s[j - 1]);
+  }
+
+  /* ---------- 規則8：電子郵件 ---------- */
+  const EMAIL = /(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]{1,64}@(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,24}(?![A-Za-z0-9-])/g;
+
+  function detectEmails(ctx) {
+    for (const m of ctx.source.matchAll(EMAIL)) {
+      const start = m.index;
+      const end = start + m[0].length;
+      // 連線字串的「密碼@主機」長得像信箱，交給連線字串規則處理
+      if (ctx.uriAuthorities.some(([a, b]) => start < b && end > a)) continue;
+      add(ctx, {
+        start, end, type: 'EMAIL', priority: PRIORITY.pattern, confidence: '中',
+        reason: '符合電子郵件的格式，連網域一起換掉。',
+      });
+    }
+  }
+
+  /* ---------- 規則9：台灣身分證字號 ---------- */
+  const TWID = /(?<![A-Za-z0-9_])[A-Za-z][12]\d{8}(?![A-Za-z0-9_])/g;
+  const LETTER_CODES = {
+    A: 10, B: 11, C: 12, D: 13, E: 14, F: 15, G: 16, H: 17, I: 34, J: 18, K: 19, L: 20, M: 21,
+    N: 22, O: 35, P: 23, Q: 24, R: 25, S: 26, T: 27, U: 28, V: 29, W: 32, X: 30, Y: 31, Z: 33,
+  };
+
+  // 檢查碼：英文字母換成兩位數，十位數×1、個位數×9，後面八碼依序×8到×1，最後一碼×1，總和要是10的倍數。
+  function validTaiwanId(value) {
+    const id = value.toUpperCase();
+    if (!/^[A-Z][12]\d{8}$/.test(id)) return false;
+    const code = LETTER_CODES[id[0]];
+    let sum = Math.floor(code / 10) + (code % 10) * 9;
+    for (let i = 1; i <= 8; i++) sum += Number(id[i]) * (9 - i);
+    sum += Number(id[9]);
+    return sum % 10 === 0;
+  }
+
+  function detectTaiwanIds(ctx) {
+    for (const m of ctx.source.matchAll(TWID)) {
+      const ok = validTaiwanId(m[0]);
+      add(ctx, {
+        start: m.index, end: m.index + m[0].length, type: 'TWID', priority: PRIORITY.pattern, confidence: ok ? '高' : '低',
+        reason: ok
+          ? '符合身分證字號的格式，檢查碼也正確。'
+          : '格式像身分證字號，但檢查碼不對，可能是打錯的號碼；保險起見還是建議遮罩。',
+      });
+    }
+  }
+
+  /* ---------- 規則10：台灣手機號碼 ---------- */
+  const PHONE = /(?<![A-Za-z0-9_+])(?:09\d{2}[ -]?\d{3}[ -]?\d{3}|\+886[ -]?9\d{2}[ -]?\d{3}[ -]?\d{3})(?![A-Za-z0-9_])/g;
+
+  function detectPhones(ctx) {
+    for (const m of ctx.source.matchAll(PHONE)) {
+      add(ctx, {
+        start: m.index, end: m.index + m[0].length, type: 'PHONE', priority: PRIORITY.pattern, confidence: '中',
+        reason: '符合台灣手機號碼的格式（09開頭10碼，或+886開頭）。',
+      });
+    }
+  }
+
+  /* ---------- 規則11：IPv4位址 ---------- */
+  const IPV4 = /(?<![A-Za-z0-9_.])(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?![A-Za-z0-9_]|\.\d)/g;
+  const IP_REASON = {
+    loopback: '本機位址（127開頭），只代表你自己的電腦，預設保留。',
+    private: '內部網路位址（10.、172.16～31.、192.168.開頭），預設保留。',
+    documentation: '文件範例專用的位址（RFC 5737），預設遮罩。',
+    other: '不是內部網路或本機的IPv4位址，預設遮罩。',
+  };
+  const IP_RISK = {
+    loopback: '透露的資訊很少，但仍是網路設定的線索。',
+    private: '可能透露你家裡或公司的內部網路配置。',
+    documentation: '可能透露網路位置。',
+    other: '可能透露你或伺服器的網路位置。',
+  };
+
+  function ipv4Kind([a, b, c]) {
+    if (a === 127) return 'loopback';
+    if (a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168)) return 'private';
+    if ((a === 192 && b === 0 && c === 2) || (a === 198 && b === 51 && c === 100) || (a === 203 && b === 0 && c === 113)) {
+      return 'documentation';
+    }
+    return 'other';
+  }
+
+  function detectIpv4(ctx) {
+    for (const m of ctx.source.matchAll(IPV4)) {
+      const parts = m.slice(1, 5);
+      if (parts.some((p) => Number(p) > 255 || (p.length > 1 && p[0] === '0'))) continue;
+      const kind = ipv4Kind(parts.map(Number));
+      const keep = kind === 'loopback' || kind === 'private';
+      add(ctx, {
+        start: m.index, end: m.index + m[0].length, type: 'IP', priority: PRIORITY.pattern, confidence: '中',
+        selected: !keep,
+        reason: IP_REASON[kind] + '四段數字的版本號也可能被誤認成IP，這種情況改成保留就好。',
+        risk: IP_RISK[kind],
+      });
+    }
+  }
+
+  /* ---------- 規則12：使用者自訂文字 ---------- */
+  // 完全一樣才算（區分大小寫）。如果藏在比較長的英數名稱裡（例如 secret 在 prefixsecretsuffix 裡），
+  // 換掉之後代號會黏住旁邊的字、沒辦法還原，所以不遮，改成提醒。
+  function wordAround(s, start, end) {
+    let a = start;
+    let b = end;
+    while (a > 0 && isWordChar(s[a - 1])) a--;
+    while (b < s.length && isWordChar(s[b])) b++;
+    return s.slice(a, b);
+  }
+
+  function detectKeywords(ctx, entries) {
+    const s = ctx.source;
+    for (const { text, type } of entries) {
+      const inside = [];
+      let from = 0;
+      for (;;) {
+        const at = s.indexOf(text, from);
+        if (at === -1) break;
+        const end = at + text.length;
+        const glued = (isWordChar(text[0]) && isWordChar(s[at - 1]))
+          || (isWordChar(text[text.length - 1]) && isWordChar(s[end]));
+        if (glued) {
+          inside.push(at);
+        } else {
+          add(ctx, {
+            start: at, end, type, priority: PRIORITY.custom, confidence: '自訂',
+            reason: `你在自訂文字加入的${TYPES[type].label}。`,
+          });
+        }
+        from = end;
+      }
+      if (inside.length) {
+        const first = inside[0];
+        const word = wordAround(s, first, first + text.length);
+        warn(ctx, first, 'keyword-inside', 'confirm',
+          `「${text}」有${inside.length}處出現在比較長的名稱裡（例如「${shorten(word, 40)}」），換掉會沒辦法正確還原，所以這些地方沒有遮。`, {
+            risk: '你指定要遮的文字，在這些地方會原樣送出。',
+            fix: '把包含它的完整名稱也加進自訂文字，再重新掃描。',
+            ranges: inside.map((at) => [at, at + text.length]),
+          });
+      }
+    }
+  }
+
+  /* ---------- 私鑰區塊：這一版不遮，直接擋下複製 ---------- */
+  const KEY_MARKER = /-----(BEGIN|END) ([A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?)-----/g;
+
+  function detectPrivateKeys(ctx) {
+    let open = false;
+    for (const m of ctx.source.matchAll(KEY_MARKER)) {
+      if (m[1] === 'BEGIN') {
+        warn(ctx, m.index, 'private-key', 'block',
+          `有私鑰區塊（${m[2]}）。這個工具沒辦法遮罩私鑰，請先從原文刪掉整段私鑰再掃描；在那之前不能複製結果。`);
+        open = true;
+      } else {
+        if (!open) {
+          warn(ctx, m.index, 'private-key', 'block',
+            `有私鑰的結尾標記（END ${m[2]}），前面可能貼到了私鑰內容。請先從原文刪掉這段再掃描；在那之前不能複製結果。`);
+        }
+        open = false;
+      }
+    }
+  }
+
+  /* ================================================================
+   * 代號：撞名處理、還原、疑似改寫
+   * ================================================================ */
+  const TOKEN_GROUP = TOKEN_TYPES.join('|');
+  // 原文裡已經有的代號寫法（連藏在長名稱裡的也算），新代號要跳過它們
+  const RESERVED = new RegExp(`(?:${TOKEN_GROUP})_\\d+(?!\\d)`, 'g');
+  // 完整的代號：前後不能緊貼英數字或底線，所以 USER_1 不會被 USER_10 或 OTHER_USER_1 誤認
+  const TOKEN = new RegExp(`(?<![A-Za-z0-9_])(?:${TOKEN_GROUP})_\\d+(?![A-Za-z0-9_])`, 'g');
+  // 可能被AI改寫過的樣子：user_3、USER-3、USER 3、USER3
+  const VARIANT = new RegExp(`(?<![A-Za-z0-9_])(${TOKEN_GROUP})[ _\\-－＿]?(\\d+)`, 'gi');
+  const CJK_LABEL = {
+    使用者: 'USER', 電腦名稱: 'HOST', 主機: 'HOST', 金鑰: 'KEY', 權杖: 'TOKEN', 密碼: 'SECRET', 機密: 'SECRET',
+    信箱: 'EMAIL', 電子郵件: 'EMAIL', 身分證: 'TWID', 手機: 'PHONE', 電話: 'PHONE', 姓名: 'NAME', 名字: 'NAME',
+    學號: 'SID', 專案: 'PROJECT',
+  };
+  const CJK_VARIANT = new RegExp(`(${Object.keys(CJK_LABEL).join('|')})[ _\\-－＿]?(\\d+)`, 'g');
+
+  function findReserved(source) {
+    const reserved = new Set();
+    for (const m of source.matchAll(RESERVED)) reserved.add(m[0]);
+    return reserved;
+  }
+
+  function findVariants(source) {
+    const variants = new Set();
+    for (const m of source.matchAll(VARIANT)) variants.add(m[0].toLowerCase());
+    for (const m of source.matchAll(CJK_VARIANT)) variants.add(m[0].toLowerCase());
+    return variants;
+  }
+
+  /* ---------- 整理候選 ---------- */
+
+  // 同一段文字被好幾條規則抓到：留下優先順序最高的，理由合併；只要有一條建議遮罩就預設遮罩
+  function mergeSameSpan(list) {
+    const bySpan = new Map();
+    for (const c of list) {
+      const key = c.start + ':' + c.end;
+      const prev = bySpan.get(key);
+      if (!prev) {
+        bySpan.set(key, c);
+        continue;
+      }
+      const [keep, drop] = c.priority > prev.priority ? [c, prev] : [prev, c];
+      for (const reason of drop.reasons) if (!keep.reasons.includes(reason)) keep.reasons.push(reason);
+      keep.selected = keep.selected || drop.selected;
+      bySpan.set(key, keep);
+    }
+    return [...bySpan.values()];
+  }
+
+  // 記下每一筆和哪些候選重疊，畫面會提醒「只要其中一筆遮罩，重疊的部分就會被遮住」
+  function markOverlaps(list) {
+    for (let i = 0; i < list.length; i++) {
+      for (let j = i + 1; j < list.length && list[j].start < list[i].end; j++) {
+        list[i].overlaps.push(list[j].id);
+        list[j].overlaps.push(list[i].id);
+      }
+    }
+  }
+
+  /* ---------- 自訂文字檢查 ---------- */
+
+  // 回傳錯誤訊息；沒問題回傳 null
+  function checkKeyword(text, type, existing = []) {
+    if (typeof text !== 'string') return '請輸入要遮的文字。';
+    if (/[\r\n]/.test(text)) return '自訂文字不能換行，請一行一行分開加。';
+    const value = text.trim();
+    if (!value) return '請輸入要遮的文字。';
+    if (value.length > LIMITS.keywordLength) return `每筆最多${LIMITS.keywordLength}個字。`;
+    if (/["'`()[\]{}<>\\/]/.test(value)) return '自訂文字不能包含引號、括號或斜線，這些符號屬於程式結構。請只填名稱本身。';
+    if (!CUSTOM_TYPES.includes(type)) return '請選擇類型。';
+    if (existing.some((e) => e.text === value)) return '這段文字已經加過了。';
+    if (existing.length >= LIMITS.keywords) return `自訂文字最多${LIMITS.keywords}筆。`;
+    return null;
+  }
+
+  function normalizeKeywords(list) {
+    if (!Array.isArray(list)) throw new InputError('自訂文字的格式不正確。');
+    if (list.length > LIMITS.keywords) throw new InputError(`自訂文字最多${LIMITS.keywords}筆。`);
+    const out = [];
+    for (const item of list) {
+      const problem = checkKeyword(item && item.text, item && item.type, out);
+      if (problem) throw new InputError(`自訂文字「${shorten(String(item && item.text), 20)}」：${problem}`);
+      out.push({ text: item.text.trim(), type: item.type });
+    }
+    return out;
+  }
+
+  /* ================================================================
+   * 對外的步驟：掃描 → 產生 → 還原
+   * ================================================================ */
+
+  function scan(source, keywords = []) {
+    if (typeof source !== 'string') throw new InputError('沒有收到要掃描的文字。');
+    if (source.length > LIMITS.text) {
+      throw new InputError(`原文有${fmt(source.length)}字，超過${fmt(LIMITS.text)}字的上限。請分成幾段處理，這次沒有產生任何結果。`);
+    }
+    const entries = normalizeKeywords(keywords);
+    const ctx = newContext(source);
+
+    detectWindowsUsers(ctx);
+    detectUnixUsers(ctx);
+    detectHostNames(ctx);
+    detectKnownKeys(ctx);
+    detectJwts(ctx);
+    detectConnectionStrings(ctx);
+    detectSecretFields(ctx); // 要在金鑰規則之後，才能合併同一把金鑰
+    detectEmails(ctx); // 要在連線字串之後，才能排除「密碼@主機」
+    detectTaiwanIds(ctx);
+    detectPhones(ctx);
+    detectIpv4(ctx);
+    detectKeywords(ctx, entries);
+    detectPrivateKeys(ctx);
+
+    const candidates = mergeSameSpan(ctx.found)
+      .sort((a, b) => a.start - b.start || b.end - a.end || b.priority - a.priority);
+    if (candidates.length > LIMITS.candidates) throw tooMany();
+    candidates.forEach((c, i) => {
+      c.id = i;
+      c.overlaps = [];
+    });
+    markOverlaps(candidates);
+    ctx.warnings.sort((a, b) => a.offset - b.offset);
+
+    return {
+      candidates,
+      warnings: ctx.warnings,
+      reserved: findReserved(source),
+      variants: findVariants(source),
+      lineStarts: ctx.lineStarts,
+    };
+  }
+
+  // 一批資料：掃描結果 + 代號分配紀錄。同一批裡，同樣的內容永遠拿到同一個代號。
+  function createBatch(source, keywords = []) {
+    return {
+      source,
+      ...scan(source, keywords),
+      allocations: new Map(), // 「類型 + 原文片段」→ 代號
+      assigned: new Set(), // 已經分配出去的代號
+      nextNumber: Object.create(null), // 每種類型下一個要試的編號
+    };
+  }
+
+  function allocate(batch, type, raw) {
+    const key = type + '\u0000' + raw;
+    const known = batch.allocations.get(key);
+    if (known) return known;
+    let n = batch.nextNumber[type] || 1;
+    while (batch.reserved.has(`${type}_${n}`) || batch.assigned.has(`${type}_${n}`)) n++; // 跳過原文已有的寫法
+    const token = `${type}_${n}`;
+    batch.nextNumber[type] = n + 1;
+    batch.assigned.add(token);
+    batch.allocations.set(key, token);
+    return token;
+  }
+
+  // 一次把文字裡的代號換回原文。換回來的內容不會再被當成代號解析（不連鎖替換）。
+  function replaceTokens(text, activeMap, reserved) {
+    const segments = [];
+    const restored = new Map();
+    const reservedSeen = new Map();
+    const unknown = new Map();
+    const bump = (map, key) => map.set(key, (map.get(key) || 0) + 1);
+    let cursor = 0;
+    for (const m of text.matchAll(TOKEN)) {
+      const token = m[0];
+      if (activeMap.has(token)) {
+        if (m.index > cursor) segments.push({ text: text.slice(cursor, m.index) });
+        segments.push({ text: activeMap.get(token), token });
+        cursor = m.index + token.length;
+        bump(restored, token);
+      } else if (reserved.has(token)) {
+        bump(reservedSeen, token);
+      } else {
+        bump(unknown, token);
+      }
+    }
+    if (cursor < text.length) segments.push({ text: text.slice(cursor) });
+    return { text: segments.map((seg) => seg.text).join(''), segments, restored, reservedSeen, unknown };
+  }
+
+  const lineBreaks = (text) => text.match(/\r\n|\r|\n/g) || [];
+  const indents = (text) => text.split(/\r\n|\r|\n/).map((line) => /^[ \t]*/.exec(line)[0]);
+  const sameList = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
+
+  function parsesAsJson(text) {
+    try {
+      JSON.parse(text);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // 代號為什麼跳號：比這次用到的最大編號小、卻沒有用到的號碼，
+  // 不是原文本來就有（reserved），就是這一批之前分配給別的內容、現在選了保留（earlier）
+  function skippedNumbers(batch, emitted) {
+    const byType = new Map();
+    for (const token of emitted) {
+      const cut = token.lastIndexOf('_');
+      const type = token.slice(0, cut);
+      if (!byType.has(type)) byType.set(type, []);
+      byType.get(type).push(Number(token.slice(cut + 1)));
+    }
+    const out = [];
+    for (const [type, numbers] of byType) {
+      numbers.sort((a, b) => a - b);
+      const used = new Set(numbers);
+      const reserved = [];
+      const earlier = [];
+      for (let n = 1; n < numbers[numbers.length - 1]; n++) {
+        if (used.has(n)) continue;
+        const name = `${type}_${n}`;
+        if (batch.reserved.has(name)) reserved.push(name);
+        else if (batch.assigned.has(name)) earlier.push(name);
+      }
+      if (reserved.length || earlier.length) {
+        out.push({ type, used: numbers.map((n) => `${type}_${n}`), reserved, earlier });
+      }
+    }
+    return out;
+  }
+
+  // 依照目前的遮罩／保留選擇，產生要貼給AI的內容，並做三項檢查
+  function generate(batch) {
+    const { source } = batch;
+    const chosen = batch.candidates
+      .filter((c) => c.selected)
+      .sort((a, b) => a.start - b.start || b.end - a.end);
+
+    // 重疊或緊貼的範圍合併成一組；緊貼的兩個代號會黏在一起，所以也要合併
+    const groups = [];
+    for (const c of chosen) {
+      const last = groups[groups.length - 1];
+      if (last && c.start <= last.end) {
+        last.end = Math.max(last.end, c.end);
+        last.members.push(c);
+      } else {
+        groups.push({ start: c.start, end: c.end, members: [c] });
+      }
+    }
+
+    const lineStarts = batch.lineStarts;
+    const activeMap = new Map(); // 代號 → 原文片段（只放這次真的用到的）
+    const emitted = [];
+    const replacements = [];
+    const problems = [];
+    let merged = 0;
+    let body = '';
+    let cursor = 0;
+
+    for (const g of groups) {
+      const raw = source.slice(g.start, g.end);
+      const covering = g.members
+        .filter((c) => c.start === g.start && c.end === g.end)
+        .sort((a, b) => b.priority - a.priority);
+      // 有一筆剛好蓋住整組，就用它的類型；只是部分交叉的，合併成 WORD
+      const type = covering.length ? covering[0].type : 'WORD';
+      if (g.members.length > 1) merged++;
+      if (!covering.length && /["'`\r\n]/.test(raw)) {
+        problems.push({ kind: 'merge', line: lineOf(lineStarts, g.start).line, raw });
+      }
+      if (isWordChar(source[g.start - 1]) || isWordChar(source[g.end])) {
+        problems.push({ kind: 'glued', line: lineOf(lineStarts, g.start).line, raw });
+      }
+      const token = allocate(batch, type, raw);
+      body += source.slice(cursor, g.start) + token;
+      cursor = g.end;
+      if (!activeMap.has(token)) {
+        activeMap.set(token, raw);
+        emitted.push(token);
+      }
+      replacements.push({ start: g.start, end: g.end, token, type, memberIds: g.members.map((c) => c.id) });
+    }
+    body += source.slice(cursor);
+
+    // 檢查1：遮罩後直接還原，要和原文一字不差
+    const roundTrip = replaceTokens(body, activeMap, batch.reserved).text === source;
+    // 檢查2：換行和每一行開頭的縮排都不能變
+    const structure = sameList(lineBreaks(body), lineBreaks(source)) && sameList(indents(body), indents(source));
+    // 檢查3：原文是有效的JSON（物件、陣列、字串、數字、true/false、null 都算）時，遮罩後也要能解析
+    const jsonApplicable = parsesAsJson(source);
+    const json = { applicable: jsonApplicable, ok: jsonApplicable ? parsesAsJson(body) : true };
+
+    // 已經認出、但沒有完整遮住的敏感內容。使用者補了遮罩、範圍都被遮住的就不算。
+    const covered = ([a, b]) => {
+      let low = 0;
+      let high = groups.length - 1;
+      while (low <= high) {
+        const mid = (low + high) >> 1;
+        const g = groups[mid];
+        if (g.end <= a) low = mid + 1;
+        else if (g.start > a) high = mid - 1;
+        else return g.end >= b;
+      }
+      return false;
+    };
+    const incomplete = batch.warnings.filter((w) => w.level === 'confirm' && !(w.ranges.length && w.ranges.every(covered)));
+    const notices = batch.warnings.filter((w) => w.level === 'notice');
+
+    const privateKeys = batch.warnings.filter((w) => w.level === 'block');
+    const blockers = [];
+    if (problems.length) blockers.push('problems');
+    if (!roundTrip) blockers.push('roundTrip');
+    if (!structure) blockers.push('structure');
+    if (!json.ok) blockers.push('json');
+    if (privateKeys.length) blockers.push('privateKey');
+
+    return {
+      source,
+      body,
+      replacements,
+      activeMap,
+      emitted,
+      merged,
+      problems,
+      checks: { roundTrip, structure, json },
+      blockers,
+      // 硬性檢查都通過。還有 incomplete 時，要使用者確認這次的結果才能複製（見 copyState）
+      copyAllowed: blockers.length === 0,
+      incomplete,
+      notices,
+      skipped: skippedNumbers(batch, emitted),
+      reserved: batch.reserved,
+      variants: batch.variants,
+    };
+  }
+
+  // 現在能不能複製。硬性檢查沒過，確認也沒用；有沒遮完整的地方，要確認過「這次」的結果
+  function copyState(result, confirmed) {
+    if (!result) return { allowed: false, reason: 'none' };
+    if (!result.copyAllowed) return { allowed: false, reason: 'blocked' };
+    if (result.incomplete.length && confirmed !== true) return { allowed: false, reason: 'confirm' };
+    return { allowed: true, reason: result.incomplete.length ? 'confirmed' : 'ok' };
+  }
+
+  // 給AI的說明：只列這次真的出現的代號
+  function guideFor(tokens) {
+    return `以下內容中的${tokens.join('、')}是隱私保護代號，代表被隱藏的原始資料。` +
+      '回答時請原樣保留這些代號（拼字、大小寫和編號都不要改），不要翻譯、重新命名，也不要猜測原始內容；' +
+      '代號出現在路徑或金鑰開頭後面時，也請保留周圍的格式。';
+  }
+
+  function buildPrompt(result, includeGuide = true) {
+    if (!includeGuide || !result.emitted.length) return result.body;
+    return guideFor(result.emitted) + '\n\n' + result.body;
+  }
+
+  // 找出可能被AI改寫過的代號（不會自動換回，只提醒）
+  function findSuspected(text, result) {
+    const found = new Map();
+    for (const m of text.matchAll(VARIANT)) {
+      const likely = m[1].toUpperCase() + '_' + m[2];
+      if (!result.activeMap.has(likely)) continue;
+      let end = m.index + m[0].length;
+      const glued = isWordChar(text[end]);
+      if (m[0] === likely && !glued) continue; // 正常的代號
+      while (isWordChar(text[end])) end++;
+      const shown = text.slice(m.index, end);
+      if (!glued && result.variants.has(shown.toLowerCase())) continue; // 原文本來就有這種寫法
+      if (!found.has(shown)) found.set(shown, likely);
+    }
+    for (const m of text.matchAll(CJK_VARIANT)) {
+      const likely = CJK_LABEL[m[1]] + '_' + m[2];
+      if (!result.activeMap.has(likely) || result.variants.has(m[0].toLowerCase())) continue;
+      if (!found.has(m[0])) found.set(m[0], likely);
+    }
+    return [...found].map(([shown, likely]) => ({ text: shown, likely }));
+  }
+
+  function restore(reply, result) {
+    if (typeof reply !== 'string') throw new InputError('沒有收到AI的回覆。');
+    if (reply.length > LIMITS.text) {
+      throw new InputError(`AI的回覆有${fmt(reply.length)}字，超過${fmt(LIMITS.text)}字的上限。請分段還原，這次沒有產生任何結果。`);
+    }
+    const r = replaceTokens(reply, result.activeMap, result.reserved);
+    const toList = (map) => [...map].map(([token, count]) => ({ token, count }));
+    return {
+      text: r.text,
+      segments: r.segments,
+      restored: toList(r.restored),
+      reservedSeen: toList(r.reservedSeen),
+      unknown: toList(r.unknown),
+      absent: result.emitted.filter((token) => !r.restored.has(token)),
+      suspected: findSuspected(reply, result),
+    };
+  }
+
+  /* ---------- 範例（全部是虛構資料） ---------- */
+  const SAMPLE = Object.freeze({
+    text: String.raw`# SYNTHETIC ONLY — 教學測試，並非真實帳號、主機或憑證
+Traceback (most recent call last):
+  File "C:\Users\wang\Desktop\hw5\main.py", line 42, in load_config
+    config = read_config()
+FileNotFoundError: C:/Users/wang/Desktop/hw5/config.json:42:7
+escaped_path = "C:\\Users\\wang\\Desktop\\hw5\\main.py"
+wsl_path = "/mnt/c/Users/wang/Desktop/hw5/main.py"
+host = "DESKTOP-DEMO123"
+api_key = "sk-proj-EXAMPLE0000fake0000key0000"
+email = "demo.student@example.invalid"
+student = "SYNTHETIC_SID_001"
+author = "王小明"
+local_ip = "192.168.1.10"
+documentation_ip = "203.0.113.5"
+DATABASE_URL = "postgres://admin:demo_pass@db.example.invalid:5432/demo"
+DB_PASSWORD=demo_pass
+phone = "0912-345-678"
+id_card = "A123456789"
+session_token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJkZW1vIiwibmFtZSI6IlNZTlRIRVRJQyJ9.SYNTHETIC_signature_only"`,
+    keywords: Object.freeze([
+      Object.freeze({ text: '王小明', type: 'NAME' }),
+      Object.freeze({ text: 'SYNTHETIC_SID_001', type: 'SID' }),
+      Object.freeze({ text: 'hw5', type: 'PROJECT' }),
+    ]),
+  });
+
+  return Object.freeze({
+    LIMITS,
+    TYPES,
+    CUSTOM_TYPES,
+    InputError,
+    SAMPLE,
+    checkKeyword,
+    scan,
+    createBatch,
+    generate,
+    copyState,
+    buildPrompt,
+    restore,
+    positionOf: (batch, offset) => lineOf(batch.lineStarts, offset),
+    validTaiwanId,
+    isSecretKey,
+  });
+})();
+
+/* ================================================================
+ * 2. 畫面（只在瀏覽器執行）
+ * ================================================================ */
+(() => {
+  if (typeof document === 'undefined') return;
+
+  const PAGE_SIZE = 30;
+  const MAX_LISTED = 12; // 提醒太多時，每一類最多列幾筆
+  const { TYPES, LIMITS } = ContextMask;
+  const $ = (id) => document.getElementById(id);
+  const narrowScreen = window.matchMedia('(max-width: 767px)');
+  const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+  const isMac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
+
+  const state = {
+    keywords: [], // [{ text, type }]
+    batch: null, // 掃描結果和代號分配
+    result: null, // 遮罩結果
+    confirmed: false, // 使用者確認過「這次」的未完整遮罩項目；結果一清掉就跟著歸零，不會存起來
+    copied: false, // 這次的結果已經複製過
+    restored: null, // 還原結果
+    page: 0,
+    previewOpen: false,
+    busy: false,
+  };
+
+  /* ---------- 小工具 ---------- */
+
+  // 建立元素；文字一律走 textContent
+  function h(tag, className, text) {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined && text !== null) node.textContent = text;
+    return node;
+  }
+
+  function button(label, className) {
+    const node = h('button', className, label);
+    node.type = 'button';
+    return node;
+  }
+
+  function setNote(id, text, tone) {
+    const node = $(id);
+    node.textContent = text || '';
+    node.className = 'note' + (tone ? ' ' + tone : '');
+  }
+
+  const fmt = (n) => n.toLocaleString('en-US');
+
+  function shorten(text, max) {
+    return text.length > max ? `${text.slice(0, max)}…（共${fmt(text.length)}字）` : text;
+  }
+
+  // 列出代號：最多幾個，多的用「等N個」
+  function listTokens(tokens, max = 6) {
+    return tokens.slice(0, max).join('、') + (tokens.length > max ? `等${tokens.length}個` : '');
+  }
+
+  function scrollIntoViewIfNarrow(id) {
+    if (!narrowScreen.matches) return;
+    $(id).scrollIntoView({ block: 'start', behavior: reducedMotion.matches ? 'auto' : 'smooth' });
+  }
+
+  // 危險操作要按兩次：第一次只改按鈕文字，4秒內再按一次才執行
+  const armed = new Map();
+  function confirmTwice(node, prompt, action) {
+    const current = armed.get(node);
+    if (current) {
+      clearTimeout(current.timer);
+      node.textContent = current.label;
+      node.classList.remove('armed');
+      armed.delete(node);
+      action();
+      return;
+    }
+    const label = node.textContent;
+    node.textContent = prompt;
+    node.classList.add('armed');
+    const timer = setTimeout(() => {
+      node.textContent = label;
+      node.classList.remove('armed');
+      armed.delete(node);
+    }, 4000);
+    armed.set(node, { label, timer });
+  }
+
+  /* ---------- 目前在第幾步：那一步的面板和主要按鈕會亮起來 ---------- */
+  const STEP_PANELS = ['panelSource', 'panelReview', 'panelResult', 'panelReply', 'panelRestored'];
+
+  function currentStep() {
+    if (!state.batch) return 1;
+    if (!state.result) return 2;
+    if (state.restored) return 5;
+    if (state.copied || $('reply').value.trim()) return 4;
+    return 3;
+  }
+
+  function renderSteps() {
+    const step = currentStep();
+    STEP_PANELS.forEach((id, index) => {
+      const panel = $(id);
+      const now = index + 1 === step;
+      panel.classList.toggle('is-current', now);
+      if (now) panel.setAttribute('aria-current', 'step');
+      else panel.removeAttribute('aria-current');
+    });
+    // 最上面的步驟說明也標出目前這一步
+    for (const item of $('guideList').children) {
+      const now = Number(item.dataset.step) === step;
+      item.classList.toggle('is-now', now);
+      if (now) item.setAttribute('aria-current', 'step');
+      else item.removeAttribute('aria-current');
+    }
+  }
+
+  /* ---------- 按鈕能不能按，統一在這裡決定 ---------- */
+  function copyState() {
+    return ContextMask.copyState(state.result, state.confirmed);
+  }
+
+  function syncControls() {
+    const busy = state.busy;
+    const batch = state.batch;
+    const hasCandidates = !!batch && batch.candidates.length > 0;
+    const result = state.result;
+
+    $('btnScan').disabled = busy;
+    $('btnSample').disabled = busy;
+    $('btnClear').disabled = busy;
+    $('kwAdd').disabled = busy;
+    $('kwText').disabled = busy;
+    $('kwType').disabled = busy;
+    $('source').readOnly = busy;
+    $('btnAllMask').disabled = busy || !hasCandidates;
+    $('btnAllKeep').disabled = busy || !hasCandidates;
+    $('btnPreview').disabled = busy || !hasCandidates;
+    $('btnGenerate').disabled = busy || !batch;
+    $('btnCopy').disabled = busy || !copyState().allowed;
+    $('confirmRisk').disabled = busy || !result;
+    $('optGuide').disabled = busy || !result;
+    $('btnRestore').disabled = busy || !result || !result.copyAllowed;
+    $('btnCopyRestored').disabled = !state.restored;
+    document.body.classList.toggle('is-busy', busy);
+    renderSteps();
+  }
+
+  // 用 setTimeout 讓「掃描中…」先顯示出來，再做比較花時間的工作
+  function runBusy(noteId, message, task) {
+    if (state.busy) return;
+    state.busy = true;
+    setNote(noteId, message);
+    syncControls();
+    setTimeout(() => {
+      try {
+        task();
+      } catch (error) {
+        setNote(noteId, error instanceof ContextMask.InputError ? error.message : '發生沒預料到的錯誤，這次沒有產生結果。請重新整理後再試一次。', 'err');
+      } finally {
+        state.busy = false;
+        syncControls();
+      }
+    }, 30);
+  }
+
+  /* ---------- 清除（從下游往上游） ---------- */
+
+  function clearRestored() {
+    state.restored = null;
+    $('restoredText').replaceChildren(h('span', 'placeholder', '還原後的內容會出現在這裡。'));
+    $('restoredBadge').hidden = true;
+    $('restoreSummary').replaceChildren();
+    $('report').replaceChildren(h('p', 'muted', '還原之後，這裡會列出每個代號的處理情況。'));
+    setNote('restoredNote', '');
+  }
+
+  function clearResult() {
+    state.result = null;
+    state.confirmed = false; // 確認只算當次的結果
+    state.copied = false;
+    $('confirmRisk').checked = false;
+    $('copyText').value = '';
+    renderResult();
+    clearRestored();
+    setNote('copyNote', '');
+    setNote('restoreNote', '先完成第3步，才能還原。');
+  }
+
+  function clearBatch() {
+    state.batch = null;
+    state.page = 0;
+    clearResult();
+    renderReview();
+  }
+
+  // 原文或自訂文字改了：舊的掃描結果和對照表全部作廢
+  function invalidateInput(message) {
+    const hadWork = !!state.batch;
+    clearBatch();
+    if (hadWork && message) setNote('scanNote', message, 'warn');
+    syncControls();
+  }
+
+  // 只改了遮罩／保留：舊的遮罩結果和對照表作廢，掃描結果留著
+  function invalidateReview() {
+    const hadResult = !!state.result;
+    clearResult();
+    renderStats();
+    renderPreview();
+    if (hadResult) setNote('reviewNote', '選擇有變更，舊的結果已清掉，之前的確認也不算了。請重新按「產生遮罩結果」。', 'warn');
+    else setNote('reviewNote', '');
+    syncControls();
+  }
+
+  /* ---------- 字數 ---------- */
+  function updateCount(fieldId, countId) {
+    const length = $(fieldId).value.length;
+    const node = $(countId);
+    node.textContent = `${fmt(length)}／${fmt(LIMITS.text)}字`;
+    node.classList.toggle('over', length > LIMITS.text);
+  }
+
+  /* ---------- 第1步：自訂文字 ---------- */
+  function renderKeywords() {
+    const list = $('kwList');
+    list.replaceChildren();
+    state.keywords.forEach((kw, index) => {
+      const li = h('li', 'kw');
+      li.append(h('span', `kw-type t-${kw.type}`, TYPES[kw.type].label), h('code', 'kw-text', kw.text));
+      const remove = button('移除', 'kw-remove');
+      remove.setAttribute('aria-label', `移除「${kw.text}」`);
+      remove.addEventListener('click', () => {
+        if (state.busy) return;
+        state.keywords.splice(index, 1);
+        renderKeywords();
+        setNote('kwNote', `已移除「${kw.text}」。`);
+        invalidateInput('自訂文字有變更，請重新掃描。');
+      });
+      li.append(remove);
+      list.append(li);
+    });
+    $('kwCount').textContent = `${state.keywords.length}／${LIMITS.keywords}筆`;
+  }
+
+  /* ---------- 第2步：審查 ---------- */
+  function renderReview() {
+    renderStats();
+    renderAlerts();
+    renderCandidates();
+    renderPreview();
+  }
+
+  function renderStats() {
+    const batch = state.batch;
+    if (!batch) {
+      $('reviewBadge').textContent = '還沒掃描';
+      $('reviewStats').textContent = '掃描後會列出找到的內容，每一筆都可以選擇遮罩或保留。';
+      return;
+    }
+    const total = batch.candidates.length;
+    const masked = batch.candidates.filter((c) => c.selected).length;
+    $('reviewBadge').textContent = total ? `${total}筆` : '沒有找到';
+    let text = total
+      ? `遮罩${masked}筆、保留${total - masked}筆。同樣的內容出現幾次就列幾次，可以分開決定。`
+      : '沒有找到符合規則的內容。這不代表沒有敏感資訊，複製前請自己再看一遍。';
+    if (state.result && state.result.merged) text += `有${state.result.merged}組重疊或相連的內容合併成一個代號。`;
+    $('reviewStats').textContent = text;
+  }
+
+  // 提醒框：標題和說明都用文字，不只靠顏色
+  function alertBox(kind, title, lines) {
+    const box = h('div', `alert ${kind}`);
+    box.append(h('p', 'alert-title', title));
+    for (const line of [].concat(lines)) if (line) box.append(h('p', 'alert-text', line));
+    return box;
+  }
+
+  const LEVEL_TITLE = { block: '不能複製', confirm: '沒有完整遮罩', notice: '提醒' };
+  const LEVEL_CLASS = { block: 'block', confirm: 'warn', notice: 'info' };
+
+  function warningLines(w) {
+    const lines = [w.message];
+    if (w.risk) lines.push(`風險：${w.risk}`);
+    if (w.fix) lines.push(`可以這樣處理：${w.fix}`);
+    return lines;
+  }
+
+  function renderAlerts() {
+    const host = $('alerts');
+    host.replaceChildren();
+    const batch = state.batch;
+    if (!batch) return;
+    const order = { block: 0, confirm: 1, notice: 2 };
+    const sorted = batch.warnings.slice().sort((a, b) => order[a.level] - order[b.level] || a.offset - b.offset);
+    const MAX_ALERTS = 20;
+    for (const w of sorted.slice(0, MAX_ALERTS)) {
+      host.append(alertBox(LEVEL_CLASS[w.level], `第${w.line}行・${LEVEL_TITLE[w.level]}`, warningLines(w)));
+    }
+    if (sorted.length > MAX_ALERTS) {
+      host.append(alertBox('warn', `還有${sorted.length - MAX_ALERTS}處`, '類似的提醒太多，只列出前20處。建議把內容分段處理。'));
+    }
+    // 只提醒會和新代號撞到的寫法（USER_01 這種有前導0的不會撞到）
+    const names = [...batch.reserved].filter((name) => /_[1-9]\d*$/.test(name));
+    if (names.length) {
+      host.append(alertBox('info', '原文裡已經有代號的寫法',
+        `原文本來就有${listTokens(names, 8)}，新的代號會跳過這些編號，還原時也不會動到它們。`));
+    }
+  }
+
+  function tokensByCandidate() {
+    const map = new Map();
+    if (!state.result) return map;
+    for (const rep of state.result.replacements) for (const id of rep.memberIds) map.set(id, rep.token);
+    return map;
+  }
+
+  function candidateRow(c, tokenOf) {
+    const li = h('li', `cand ${c.selected ? 'is-mask' : 'is-keep'}`);
+    li.id = `cand-${c.id}`;
+    li.tabIndex = -1;
+
+    const top = h('div', 'cand-top');
+    top.append(h('span', 'cand-no', `#${c.id + 1}`), h('span', `type t-${c.type}`, TYPES[c.type].label));
+    top.append(h('span', 'conf', c.confidence === '自訂' ? '你指定的' : `可信度${c.confidence}`));
+
+    const toggle = h('div', 'toggle');
+    toggle.setAttribute('role', 'group');
+    toggle.setAttribute('aria-label', `#${c.id + 1}要遮罩還是保留`);
+    const maskButton = button('遮罩', 'opt-mask');
+    const keepButton = button('保留', 'opt-keep');
+    maskButton.setAttribute('aria-pressed', String(c.selected));
+    keepButton.setAttribute('aria-pressed', String(!c.selected));
+    maskButton.addEventListener('click', () => setSelected(c, true));
+    keepButton.addEventListener('click', () => setSelected(c, false));
+    toggle.append(maskButton, keepButton);
+    top.append(toggle);
+    li.append(top);
+
+    const value = h('div', 'cand-value');
+    value.append(h('code', 'raw', shorten(c.raw, 160)));
+    const token = tokenOf.get(c.id);
+    if (token) {
+      const arrow = h('span', 'becomes');
+      arrow.append(h('span', 'becomes-label', '換成'), h('span', 'tape', token));
+      value.append(arrow);
+    }
+    li.append(value);
+
+    const pos = ContextMask.positionOf(state.batch, c.start);
+    const meta = h('p', 'meta');
+    meta.append(h('span', null, `第${pos.line}行第${pos.column}字`));
+    if (c.overlaps.length) {
+      meta.append(h('span', 'overlap',
+        `和${c.overlaps.map((id) => `#${id + 1}`).join('、')}重疊：只要其中一筆選遮罩，重疊的部分就會被遮住。`));
+    }
+    li.append(meta);
+
+    // 判斷依據和保留的風險收起來，需要時再展開
+    const more = h('details', 'cand-more');
+    more.append(h('summary', null, '判斷依據與保留的風險'));
+    const why = h('p', 'why');
+    why.append(h('b', null, '為什麼被偵測'), document.createTextNode(c.reasons.join('')));
+    const risk = h('p', 'risk');
+    risk.append(h('b', null, '如果保留'), document.createTextNode(c.risk));
+    more.append(why, risk);
+    // 選了保留的話，風險直接顯示，不用展開
+    if (!c.selected) li.append(h('p', 'kept-risk', `保留的話：${c.risk}這一筆會原樣送給AI。`));
+    li.append(more);
+    return li;
+  }
+
+  function renderCandidates() {
+    const list = $('candList');
+    const pager = $('pager');
+    list.replaceChildren();
+    const batch = state.batch;
+    if (!batch) {
+      list.append(h('li', 'empty', '貼上內容後按「掃描敏感資訊」，找到的東西會一筆一筆列在這裡。'));
+      pager.hidden = true;
+      return;
+    }
+    const total = batch.candidates.length;
+    if (!total) {
+      list.append(h('li', 'empty', '沒有找到符合規則的內容。規則只認得常見的格式，姓名、學號這類可以用自訂文字補上。'));
+      pager.hidden = true;
+      return;
+    }
+    const pages = Math.ceil(total / PAGE_SIZE);
+    state.page = Math.min(state.page, pages - 1);
+    const tokenOf = tokensByCandidate();
+    for (const c of batch.candidates.slice(state.page * PAGE_SIZE, (state.page + 1) * PAGE_SIZE)) {
+      list.append(candidateRow(c, tokenOf));
+    }
+    pager.hidden = pages <= 1;
+    $('pageInfo').textContent = `第${state.page + 1}頁，共${pages}頁`;
+    $('btnPrev').disabled = state.page === 0;
+    $('btnNext').disabled = state.page >= pages - 1;
+  }
+
+  function setSelected(candidate, value) {
+    if (state.busy || candidate.selected === value) return;
+    candidate.selected = value;
+    invalidateReview();
+    renderCandidates();
+    const row = $(`cand-${candidate.id}`);
+    if (row) row.querySelector(value ? '.opt-mask' : '.opt-keep').focus();
+  }
+
+  function setAll(value) {
+    if (!state.batch) return;
+    state.batch.candidates.forEach((c) => {
+      c.selected = value;
+    });
+    invalidateReview();
+    renderCandidates();
+    setNote('reviewNote', value ? '全部改成遮罩了。' : '全部改成保留了。保留的內容會原樣送給AI。', value ? '' : 'warn');
+  }
+
+  /* ---------- 原文標記預覽 ---------- */
+  let markTargets = new WeakMap();
+
+  function renderPreview() {
+    const batch = state.batch;
+    const open = state.previewOpen && !!batch && batch.candidates.length > 0;
+    $('previewBox').hidden = !open;
+    $('btnPreview').setAttribute('aria-expanded', String(open));
+    $('btnPreview').textContent = open ? '隱藏原文標記' : '顯示原文標記';
+    markTargets = new WeakMap();
+    if (!open) {
+      $('previewText').replaceChildren();
+      return;
+    }
+    const { source, candidates } = batch;
+    const cuts = new Set([0, source.length]);
+    for (const c of candidates) {
+      cuts.add(c.start);
+      cuts.add(c.end);
+    }
+    const points = [...cuts].sort((a, b) => a - b);
+    const frag = document.createDocumentFragment();
+    const active = [];
+    let next = 0;
+    for (let i = 0; i < points.length - 1; i++) {
+      const a = points[i];
+      const b = points[i + 1];
+      while (next < candidates.length && candidates[next].start <= a) active.push(candidates[next++]);
+      for (let j = active.length - 1; j >= 0; j--) if (active[j].end <= a) active.splice(j, 1);
+      const text = source.slice(a, b);
+      if (!active.length) {
+        frag.append(document.createTextNode(text));
+        continue;
+      }
+      const top = active.reduce((x, y) => (y.priority > x.priority ? y : x));
+      const masked = active.some((c) => c.selected);
+      const mark = h('mark', masked ? 'mask' : 'keep', text);
+      mark.title = `#${top.id + 1} ${TYPES[top.type].label}（${masked ? '遮罩' : '保留'}）`;
+      markTargets.set(mark, top.id);
+      frag.append(mark);
+    }
+    $('previewText').replaceChildren(frag);
+  }
+
+  function focusCandidate(id) {
+    state.page = Math.floor(id / PAGE_SIZE);
+    renderCandidates();
+    const row = $(`cand-${id}`);
+    if (!row) return;
+    row.scrollIntoView({ block: 'nearest', behavior: reducedMotion.matches ? 'auto' : 'smooth' });
+    row.focus({ preventScroll: true });
+    row.classList.add('flash');
+    setTimeout(() => row.classList.remove('flash'), 1200);
+  }
+
+  /* ---------- 第3步：遮罩結果 ---------- */
+
+  // 代號為什麼跳號（依實際分配算出來的）
+  function skipText(item) {
+    const label = TYPES[item.type].label;
+    const parts = [];
+    if (item.reserved.length) {
+      const these = item.reserved.length > 1 ? '這些編號' : '這個編號';
+      parts.push(`原文本來就有${listTokens(item.reserved)}，所以${label}的新代號跳過${these}，這次用的是${listTokens(item.used)}。還原時只換這次的代號，原文的${listTokens(item.reserved)}不會被換掉。`);
+    }
+    if (item.earlier.length) {
+      parts.push(`${listTokens(item.earlier)}在這一批裡已經分配給別的內容（目前選了保留）；同一批裡同樣的內容一直用同一個代號，號碼不會給別人用。`);
+    }
+    return parts.join('');
+  }
+
+  function renderSkipNotes(r) {
+    const host = $('skipNotes');
+    host.replaceChildren();
+    if (!r) return;
+    for (const item of r.skipped) {
+      const note = h('div', 'skip-note');
+      note.append(h('p', 'skip-title', `代號為什麼從${item.used[0]}開始`), h('p', 'skip-text', skipText(item)));
+      host.append(note);
+    }
+  }
+
+  function problemText(problem) {
+    if (problem.kind === 'glued') {
+      return `第${problem.line}行的「${shorten(problem.raw, 40)}」換成代號後會和旁邊的英數字黏在一起，AI回覆時沒辦法正確換回來。請把這一筆改成保留，或把包含它的完整名稱加進自訂文字。`;
+    }
+    return `第${problem.line}行有重疊的內容合併後跨過了引號或換行，沒辦法安全地換成一個代號。請調整遮罩或保留的選擇。`;
+  }
+
+  // 複製前檢查的一個項目：符號、標籤和說明都是文字
+  function todoItem(kind, mark, label, lines) {
+    const li = h('li', `todo ${kind}`);
+    const head = h('p', 'todo-head');
+    head.append(h('span', 'todo-mark', mark), h('span', 'todo-label', label));
+    li.append(head);
+    for (const line of [].concat(lines)) if (line) li.append(h('p', 'todo-text', line));
+    return li;
+  }
+
+  function renderSummary(r) {
+    const host = $('copySummary');
+    host.replaceChildren();
+    if (!r) return;
+
+    // 已經完成的部分
+    const done = h('div', 'done-block');
+    done.append(h('p', 'done-line', r.emitted.length
+      ? `✓ 已遮罩：替換${r.replacements.length}處，用了${r.emitted.length}個代號。`
+      : '－ 這次沒有替換任何內容，送出前請再確認一次。'));
+    const checks = [
+      { ok: r.checks.roundTrip, pass: '還原測試：遮罩後再換回來，和原文一字不差。', fail: '還原測試沒通過' },
+      { ok: r.checks.structure, pass: '換行和每一行開頭的縮排都沒有改變。', fail: '換行或縮排和原文不一樣' },
+    ];
+    if (r.checks.json.applicable) {
+      checks.push({ ok: r.checks.json.ok, pass: '原文是有效的JSON，遮罩後仍然可以解析。', fail: 'JSON檢查沒通過' });
+    }
+    const passed = checks.filter((c) => c.ok);
+    if (passed.length === checks.length) {
+      const details = h('details', 'checks-more');
+      details.append(h('summary', null, `✓ ${checks.length}項格式檢查都通過${r.checks.json.applicable ? '' : '（原文不是JSON，沒有做JSON檢查）'}`));
+      const list = h('ul', 'check-list');
+      for (const c of checks) list.append(h('li', null, c.pass));
+      list.append(h('li', 'scope', '這些檢查只確認代號換得回來、格式沒有被弄壞，不代表內容裡沒有其他敏感資訊。'));
+      details.append(list);
+      done.append(details);
+    }
+    host.append(done);
+
+    // 還要處理的部分
+    const todo = h('ul', 'todo-list');
+    for (const problem of r.problems) todo.append(todoItem('block', '✕', '不能複製', problemText(problem)));
+    if (!r.checks.roundTrip) todo.append(todoItem('block', '✕', '不能複製', '有代號沒辦法正確換回原文。請重新掃描；如果還是這樣，把相關的那幾筆改成保留。'));
+    if (!r.checks.structure) todo.append(todoItem('block', '✕', '不能複製', '遮罩後換行或縮排和原文不一樣。請調整遮罩或保留的選擇。'));
+    if (r.blockers.includes('json')) {
+      todo.append(todoItem('block', '✕', '不能複製：JSON會被破壞', [
+        '原文整段是有效的JSON（單獨的數字、true、false、null也算），換成代號之後就不能解析了。通常是數字或true這類值被換成代號，例如{"sid": 123456}。',
+        '可以這樣處理：把那一筆改成保留；或修改原文（例如把數字改成字串）後重新掃描。',
+      ]));
+    }
+    if (r.blockers.includes('privateKey')) {
+      todo.append(todoItem('block', '✕', '不能複製：原文有私鑰', '這個工具沒辦法遮罩私鑰。請先從原文刪掉整段私鑰，再重新掃描。'));
+    }
+    for (const w of r.incomplete.slice(0, MAX_LISTED)) {
+      todo.append(todoItem('confirm', '!', `第${w.line}行・沒有完整遮罩`, warningLines(w)));
+    }
+    if (r.incomplete.length > MAX_LISTED) {
+      todo.append(todoItem('confirm', '!', `還有${r.incomplete.length - MAX_LISTED}處沒有完整遮罩`, '完整清單在第2步的提醒裡。'));
+    }
+    for (const w of r.notices.slice(0, MAX_LISTED)) {
+      todo.append(todoItem('notice', 'i', `第${w.line}行・提醒`, w.message));
+    }
+    const kept = state.batch.candidates.filter((c) => !c.selected);
+    if (kept.length) {
+      const counts = new Map();
+      for (const c of kept) counts.set(TYPES[c.type].label, (counts.get(TYPES[c.type].label) || 0) + 1);
+      todo.append(todoItem('kept', '－', '你選擇保留',
+        `${[...counts].map(([label, n]) => `${label}${n}筆`).join('、')}，這些會原樣送出。`));
+    }
+    if (r.body.length > LIMITS.text) {
+      todo.append(todoItem('notice', 'i', '遮罩後的內容比較長',
+        `代號比原文長，遮罩後有${fmt(r.body.length)}字。AI的回覆如果整段貼回來超過${fmt(LIMITS.text)}字，請分段還原。`));
+    }
+    if (todo.childElementCount) {
+      host.append(h('p', 'todo-title', r.copyAllowed && !r.incomplete.length ? '要注意的地方' : '還要處理的地方'));
+      host.append(todo);
+    }
+    // 送出前再看一次：重要的事直接寫出來，不用點開；按鈕帶到要看的地方
+    const pre = h('div', 'precheck');
+    pre.append(h('p', 'precheck-title', '送出前再看一次'));
+    const list = h('ol', 'precheck-list');
+    const item = (text, label, go) => {
+      const li = h('li', null, text);
+      const link = button(label, 'link');
+      link.addEventListener('click', go);
+      li.append(link);
+      list.append(li);
+    };
+    item('送出去的就是上面這段遮罩結果，黃色的是代號；勾了「開頭附上給AI的代號說明」，開頭還會多一段說明。', '看完整內容', showCopyText);
+    item('姓名、學號、專案名稱這類規則猜不到，檔名、資料夾名稱、註解和學校或公司的網域也可能透露你是誰。有的話加進自訂文字，再掃描一次。', '去加自訂文字', focusKeyword);
+    item('工具找得到什麼、找不到什麼，整理在頁面最上面。', '看支援範圍和限制', showScope);
+    pre.append(list);
+    host.append(pre);
+  }
+
+  function reveal(node, focusTarget = node) {
+    node.scrollIntoView({ block: 'center', behavior: reducedMotion.matches ? 'auto' : 'smooth' });
+    focusTarget.focus({ preventScroll: true });
+  }
+
+  function showCopyText() {
+    $('copyDetails').open = true;
+    reveal($('copyText'));
+  }
+
+  function showScope() {
+    $('scopeDetails').open = true;
+    reveal($('scopeDetails'), $('scopeDetails').querySelector('summary'));
+  }
+
+  function focusKeyword() {
+    reveal($('kwText'));
+  }
+
+  function renderConfirm(r) {
+    const show = !!r && r.incomplete.length > 0;
+    $('confirmBox').hidden = !show;
+    $('confirmRisk').checked = show && state.confirmed;
+  }
+
+  function renderResult() {
+    const r = state.result;
+    const pre = $('maskedText');
+    renderSkipNotes(r);
+    renderSummary(r);
+    renderConfirm(r);
+    if (!r) {
+      pre.replaceChildren(h('span', 'placeholder', '檢查完第2步後，按「產生遮罩結果」，這裡會出現可以貼給AI的內容。'));
+      $('resultBadge').textContent = '還沒產生';
+      return;
+    }
+
+    // 正文：原文片段用文字節點，代號用膠帶樣式標出來
+    const frag = document.createDocumentFragment();
+    let cursor = 0;
+    for (const rep of r.replacements) {
+      if (rep.start > cursor) frag.append(document.createTextNode(r.source.slice(cursor, rep.start)));
+      const tape = h('span', 'tape', rep.token);
+      tape.title = TYPES[rep.type].label;
+      frag.append(tape);
+      cursor = rep.end;
+    }
+    if (cursor < r.source.length) frag.append(document.createTextNode(r.source.slice(cursor)));
+    if (!r.source.length) frag.append(h('span', 'placeholder', '（沒有內容）'));
+    pre.replaceChildren(frag);
+
+    $('resultBadge').textContent = r.emitted.length
+      ? `替換${r.replacements.length}處，用了${r.emitted.length}個代號`
+      : '沒有替換';
+    updateCopyText();
+  }
+
+  // 要複製的完整內容：可以複製的時候才放進去
+  function updateCopyText() {
+    const now = copyState();
+    $('copyText').value = now.allowed ? ContextMask.buildPrompt(state.result, $('optGuide').checked) : '';
+    $('copyText').placeholder = {
+      blocked: '還有標「✕」的問題，處理好、重新產生之後，這裡才會顯示要貼給AI的完整內容。',
+      confirm: '勾選上面的確認之後，這裡會顯示要貼給AI的完整內容。',
+    }[now.reason] || '可以複製的時候，這裡會顯示要貼給AI的完整內容。';
+  }
+
+  // 第3步按鈕下面的說明
+  function copyNoteFor(r) {
+    const stateNow = copyState();
+    if (!r) return ['', ''];
+    if (stateNow.reason === 'blocked') return ['還有標「✕」的問題，處理好、重新產生之後才能複製。', 'err'];
+    if (stateNow.reason === 'confirm') return [`有${r.incomplete.length}處沒有完整遮罩：可以先照上面的方式處理，或勾選確認後再複製。`, 'warn'];
+    if (stateNow.reason === 'confirmed') return ['已確認這次的結果。複製後，上面列的項目會原樣送出。', 'warn'];
+    if (!r.emitted.length) return ['這次沒有替換任何內容，送出前請再確認一次。', 'warn'];
+    return ['', ''];
+  }
+
+  /* ---------- 第5步：還原結果 ---------- */
+  function countText(items) {
+    return items.map((x) => `${x.token}×${x.count}`).join('、');
+  }
+
+  function reportRow(term, text, tone) {
+    const wrap = h('div', `report-row${tone ? ' ' + tone : ''}`);
+    wrap.append(h('dt', null, term), h('dd', null, text));
+    return wrap;
+  }
+
+  // 還原結果下面的摘要：換了哪些、哪些本來就在原文所以沒換、哪些要自己確認
+  function renderRestoreSummary(rep) {
+    const host = $('restoreSummary');
+    host.replaceChildren();
+    const list = h('ul', 'todo-list');
+    const total = rep.restored.reduce((n, x) => n + x.count, 0);
+    list.append(total
+      ? todoItem('done', '✓', `換回${total}處`, `${countText(rep.restored)}已經換回原本的內容（畫面上有底線的地方）。`)
+      : todoItem('notice', '－', '沒有換回任何代號', '回覆裡沒有找到這次的代號。可能是AI沒有用到，或是代號被改寫了，請看下面。'));
+    if (rep.reservedSeen.length) {
+      list.append(todoItem('kept', '＝', '沒有換：原文本來就有',
+        `${countText(rep.reservedSeen)}是原文自己的內容，不是這次的代號，所以保持原樣。`));
+    }
+    if (rep.unknown.length) {
+      list.append(todoItem('confirm', '!', '要確認：不認得的代號',
+        `${countText(rep.unknown)}不在這次的對照表裡，沒有換。可能是AI自己編的，請不要直接當成原始資料。`));
+    }
+    if (rep.suspected.length) {
+      list.append(todoItem('confirm', '!', '要確認：看起來被改寫過',
+        `${rep.suspected.map((x) => `${x.text}（可能是${x.likely}）`).join('、')}沒有自動換回，請自己對照。`));
+    }
+    host.append(h('p', 'todo-title', '還原摘要'), list);
+  }
+
+  function renderRestored() {
+    const rep = state.restored;
+    const frag = document.createDocumentFragment();
+    for (const seg of rep.segments) {
+      if (seg.token) {
+        const span = h('span', 'restored', seg.text);
+        span.title = `由${seg.token}換回`;
+        frag.append(span);
+      } else {
+        frag.append(document.createTextNode(seg.text));
+      }
+    }
+    $('restoredText').replaceChildren(frag);
+    $('restoredBadge').hidden = false;
+    renderRestoreSummary(rep);
+
+    const dl = h('dl', 'report-list');
+    const total = rep.restored.reduce((n, x) => n + x.count, 0);
+    dl.append(reportRow('換回來了', total ? `${countText(rep.restored)}，共${total}處。` : '沒有。', total ? 'ok' : ''));
+    dl.append(reportRow('原文本來就有（沒有動）', rep.reservedSeen.length
+      ? `${countText(rep.reservedSeen)}。這些是原文自己的內容，不是這次的代號。`
+      : '沒有。'));
+    dl.append(reportRow('不認得的代號（沒有動）', rep.unknown.length
+      ? `${countText(rep.unknown)}。對照表裡沒有它們，可能是AI自己編的，請自己確認。`
+      : '沒有。', rep.unknown.length ? 'warn' : ''));
+    dl.append(reportRow('這次沒出現的代號', rep.absent.length
+      ? `${rep.absent.join('、')}。可能只是AI沒用到，不一定有問題。`
+      : '沒有，每個代號都出現了。'));
+    dl.append(reportRow('看起來被改寫過（沒有換回）', rep.suspected.length
+      ? `${rep.suspected.map((x) => `${x.text}（可能是${x.likely}）`).join('、')}。請自己對照確認。`
+      : '沒有發現。不過只認得大小寫、底線和中文名稱這幾種常見改法。', rep.suspected.length ? 'warn' : ''));
+    $('report').replaceChildren(dl);
+  }
+
+  /* ---------- 事件 ---------- */
+
+  $('source').addEventListener('input', () => {
+    updateCount('source', 'srcCount');
+    invalidateInput('原文有變更，舊的結果和確認都清掉了，請重新掃描。');
+  });
+
+  $('source').addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+      event.preventDefault();
+      $('btnScan').click();
+    }
+  });
+
+  $('kwText').addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+      event.preventDefault();
+      $('kwForm').dispatchEvent(new Event('submit', { cancelable: true }));
+    }
+  });
+
+  $('kwForm').addEventListener('submit', (event) => {
+    event.preventDefault(); // 不送出表單，只在頁面內處理
+    if (state.busy) return;
+    const type = $('kwType').value;
+    const text = $('kwText').value;
+    const problem = ContextMask.checkKeyword(text, type, state.keywords);
+    if (problem) {
+      setNote('kwNote', problem, 'err');
+      return;
+    }
+    const value = text.trim();
+    state.keywords.push({ text: value, type });
+    $('kwText').value = '';
+    renderKeywords();
+    setNote('kwNote', `已加入「${value}」（${TYPES[type].label}）。`, 'ok');
+    invalidateInput('自訂文字有變更，請重新掃描。');
+  });
+
+  $('btnScan').addEventListener('click', () => {
+    runBusy('scanNote', '掃描中…', () => {
+      clearBatch();
+      const source = $('source').value;
+      if (!source.trim()) {
+        setNote('scanNote', '請先貼上要檢查的內容，或按「載入範例」試試看。', 'err');
+        return;
+      }
+      state.batch = ContextMask.createBatch(source, state.keywords);
+      state.page = 0;
+      renderReview();
+      const n = state.batch.candidates.length;
+      const warnings = state.batch.warnings.length;
+      if (n) {
+        setNote('scanNote', `找到${n}筆${warnings ? `，另外有${warnings}處要你自己確認` : ''}。請到第2步檢查。`, 'ok');
+      } else if (warnings) {
+        setNote('scanNote', `沒有可以自動遮的內容，但有${warnings}處要你自己確認，請看第2步的提醒。`, 'warn');
+      } else {
+        setNote('scanNote', '沒有找到符合規則的內容。這不代表沒有敏感資訊，複製前請自己再看一遍。', 'warn');
+      }
+      setNote('reviewNote', '確認每一筆要遮罩還是保留，再按「產生遮罩結果」。');
+      scrollIntoViewIfNarrow('panelReview');
+    });
+  });
+
+  $('btnAllMask').addEventListener('click', () => setAll(true));
+  $('btnAllKeep').addEventListener('click', () => setAll(false));
+
+  $('btnPreview').addEventListener('click', () => {
+    state.previewOpen = !state.previewOpen;
+    renderPreview();
+  });
+
+  $('previewText').addEventListener('click', (event) => {
+    const mark = event.target.closest('mark');
+    if (mark && markTargets.has(mark)) focusCandidate(markTargets.get(mark));
+  });
+
+  $('btnPrev').addEventListener('click', () => {
+    state.page = Math.max(0, state.page - 1);
+    renderCandidates();
+  });
+  $('btnNext').addEventListener('click', () => {
+    state.page += 1;
+    renderCandidates();
+  });
+
+  $('btnGenerate').addEventListener('click', () => {
+    runBusy('reviewNote', '產生中…', () => {
+      if (!state.batch) return;
+      clearResult();
+      state.result = ContextMask.generate(state.batch);
+      renderResult();
+      renderCandidates();
+      renderStats();
+      const r = state.result;
+      if (!r.copyAllowed) {
+        setNote('reviewNote', '產生了，但有問題要先處理，請看第3步標「✕」的地方。', 'err');
+      } else if (r.incomplete.length) {
+        setNote('reviewNote', `產生了，有${r.incomplete.length}處沒有完整遮罩，請看第3步。`, 'warn');
+      } else if (!r.emitted.length) {
+        setNote('reviewNote', '產生了，這次沒有替換任何內容。', 'warn');
+      } else {
+        setNote('reviewNote', '產生完成，請到第3步複製。', 'ok');
+      }
+      setNote('copyNote', ...copyNoteFor(r));
+      setNote('restoreNote', r.copyAllowed ? '把AI的回覆貼進來，再按「還原代號」。想先試試看，也可以貼上剛才複製的內容。' : '先處理第3步的問題，才能還原。');
+      scrollIntoViewIfNarrow('panelResult');
+    });
+  });
+
+  // 確認未完整遮罩的風險：只對這一次產生的結果有效
+  $('confirmRisk').addEventListener('change', () => {
+    if (!state.result) {
+      $('confirmRisk').checked = false;
+      return;
+    }
+    state.confirmed = $('confirmRisk').checked;
+    updateCopyText();
+    setNote('copyNote', ...copyNoteFor(state.result));
+    syncControls();
+  });
+
+  $('optGuide').addEventListener('change', updateCopyText);
+
+  $('btnCopy').addEventListener('click', async () => {
+    const r = state.result;
+    if (!r || !copyState().allowed) return;
+    updateCopyText();
+    const text = $('copyText').value;
+    const confirmedNote = r.incomplete.length ? '其中有你確認過、沒有完整遮罩的項目。' : '';
+    try {
+      await navigator.clipboard.writeText(text);
+      const withGuide = $('optGuide').checked && r.emitted.length;
+      setNote('copyNote', withGuide
+        ? `已複製（開頭附上代號說明）。${confirmedNote}貼到AI的對話框，再寫上你的問題就可以了。`
+        : `已複製。${confirmedNote}貼到AI的對話框，再寫上你的問題就可以了。`, confirmedNote ? 'warn' : 'ok');
+    } catch {
+      // 瀏覽器不允許自動複製：幫使用者選好文字，請他自己按複製鍵（不會去讀剪貼簿）
+      $('copyDetails').open = true;
+      $('copyText').focus();
+      $('copyText').select();
+      setNote('copyNote', `瀏覽器沒有允許自動複製，已經幫你選好全部文字，請按${isMac ? '⌘+C' : 'Ctrl+C'}。`, 'warn');
+    }
+    state.copied = true;
+    syncControls();
+  });
+
+  $('reply').addEventListener('input', () => {
+    updateCount('reply', 'replyCount');
+    if (state.restored) {
+      clearRestored();
+      setNote('restoreNote', '回覆有變更，請重新按「還原代號」。', 'warn');
+    }
+    syncControls();
+  });
+
+  $('btnRestore').addEventListener('click', () => {
+    const r = state.result;
+    if (!r || !r.copyAllowed) return;
+    const reply = $('reply').value;
+    if (!reply.trim()) {
+      setNote('restoreNote', '請先貼上AI的回覆。', 'err');
+      return;
+    }
+    try {
+      state.restored = ContextMask.restore(reply, r);
+    } catch (error) {
+      clearRestored();
+      setNote('restoreNote', error instanceof ContextMask.InputError ? error.message : '還原時發生沒預料到的錯誤，請重新整理後再試一次。', 'err');
+      syncControls();
+      return;
+    }
+    renderRestored();
+    const rep = state.restored;
+    const total = rep.restored.reduce((n, x) => n + x.count, 0);
+    const toCheck = rep.unknown.length + rep.suspected.length;
+    setNote('restoreNote', total
+      ? `換回了${total}處${toCheck ? `，另外有${toCheck}個代號要你確認` : ''}，摘要在還原結果下面。`
+      : '沒有找到這次的代號，請看還原結果下面的摘要。', total && !toCheck ? 'ok' : 'warn');
+    setNote('restoredNote', '這裡已經是含原始資料的內容，複製或分享時請小心。', 'warn');
+    syncControls();
+    scrollIntoViewIfNarrow('panelRestored');
+  });
+
+  $('btnCopyRestored').addEventListener('click', async () => {
+    if (!state.restored) return;
+    try {
+      await navigator.clipboard.writeText(state.restored.text);
+      setNote('restoredNote', '已複製還原結果。剪貼簿裡現在有原始資料，貼完請注意。', 'ok');
+    } catch {
+      const range = document.createRange();
+      range.selectNodeContents($('restoredText'));
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      setNote('restoredNote', `瀏覽器沒有允許自動複製，已經幫你選好文字，請按${isMac ? '⌘+C' : 'Ctrl+C'}。`, 'warn');
+    }
+  });
+
+  function loadSample() {
+    $('source').value = ContextMask.SAMPLE.text;
+    state.keywords = ContextMask.SAMPLE.keywords.map((k) => ({ text: k.text, type: k.type }));
+    renderKeywords();
+    updateCount('source', 'srcCount');
+    invalidateInput();
+    setNote('kwNote', '');
+    setNote('scanNote', '已載入範例：內容全部是虛構的，也先加好三筆自訂文字。按「掃描敏感資訊」開始。', 'ok');
+    $('btnScan').focus();
+  }
+
+  $('btnSample').addEventListener('click', () => {
+    if (state.busy) return;
+    const hasContent = $('source').value.trim() || state.keywords.length;
+    if (hasContent) confirmTwice($('btnSample'), '再按一次會取代目前內容', loadSample);
+    else loadSample();
+  });
+
+  function wipeAll() {
+    for (const id of ['source', 'reply', 'kwText', 'copyText']) $(id).value = '';
+    state.keywords = [];
+    state.previewOpen = false;
+    $('kwType').value = 'NAME';
+    renderKeywords();
+    clearBatch();
+    updateCount('source', 'srcCount');
+    updateCount('reply', 'replyCount');
+    for (const id of ['kwNote', 'scanNote', 'reviewNote', 'copyNote', 'restoredNote']) setNote(id, '');
+    setNote('restoreNote', '先完成第3步，才能還原。');
+    syncControls();
+  }
+
+  $('btnClear').addEventListener('click', () => {
+    if (state.busy) return;
+    confirmTwice($('btnClear'), '再按一次確認清除', () => {
+      wipeAll();
+      setNote('scanNote', '已全部清除，對照表也刪掉了。系統剪貼簿裡的內容不會被清掉。', 'ok');
+    });
+  });
+
+  // 離開或重新整理時，對照表會消失：還有對照表時請瀏覽器先確認
+  window.addEventListener('beforeunload', (event) => {
+    if (state.result && state.result.emitted.length) {
+      event.preventDefault();
+      event.returnValue = '';
+    }
+  });
+  window.addEventListener('pagehide', wipeAll);
+  window.addEventListener('pageshow', (event) => {
+    if (event.persisted) wipeAll(); // 從上一頁快取回來時，也不留舊資料
+  });
+
+  /* ---------- 啟動 ---------- */
+  // 有些瀏覽器重新整理會自動填回輸入框，這裡明確清空，避免帶回上一批資料
+  for (const id of ['source', 'reply', 'kwText', 'copyText']) $(id).value = '';
+  $('optGuide').checked = true;
+  $('confirmRisk').checked = false;
+  renderKeywords();
+  updateCount('source', 'srcCount');
+  updateCount('reply', 'replyCount');
+  clearBatch();
+  syncControls();
+  const boot = $('bootError');
+  if (boot) boot.remove();
+})();
